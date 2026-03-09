@@ -7,7 +7,7 @@ Deep Research Agent Client
 import asyncio
 import sys
 from agents_client.streaming.base_client import A2AAgentClient
-from agents_client.utils import ReportDownloader
+from agents_client.utils import ReportDownloader, require_access_token
 
 
 # ========================================
@@ -62,7 +62,6 @@ async def run_dr_agent(stock_code: str, agent_url: str, a2a_token: str = None) -
 # ========================================
 
 if __name__ == "__main__":
-    import os
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -72,20 +71,13 @@ if __name__ == "__main__":
     stock_code = args[0] if args else DEFAULT_STOCK_CODE
 
     # 后端模式：需要 token
-    a2a_token = os.getenv("FINTOOLS_ACCESS_TOKEN")
-    if not a2a_token:
-        print("❌ 错误: 未设置 FINTOOLS_ACCESS_TOKEN 环境变量")
-        print("\n请在 .env 文件中设置:")
-        print("  FINTOOLS_ACCESS_TOKEN=your-token-here")
-        print("\n或通过命令行设置:")
-        print("  export FINTOOLS_ACCESS_TOKEN=your-token-here")
-        sys.exit(1)
+    a2a_token = require_access_token()
 
     agent_url = DEFAULT_AGENT_URL
     print(f"🔗 后端模式: {agent_url}")
 
     # 运行 + 显示 + 下载
-    success = asyncio.run(run_dr_agent(stock_code, agent_url, a2a_token))
+    asyncio.run(run_dr_agent(stock_code, agent_url, a2a_token))
     manager = ReportDownloader(agent_url, a2a_token)
     asyncio.run(manager.show_reports())
     asyncio.run(manager.download_zip())

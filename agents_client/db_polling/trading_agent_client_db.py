@@ -3,32 +3,26 @@
 Trading Agent Client - 数据库模式
 
 使用方法：
-    python -m a2a_services.agents_client.trading_agent_client_db
+    python -m agents_client.db_polling.trading_agent_client_db
 
 或者：
-    from a2a_services.agents_client.trading_agent_client_db import TradingAgentClientDB
+    from agents_client.db_polling.trading_agent_client_db import TradingAgentClientDB
     
     client = TradingAgentClientDB()
     result = await client.analyze_stock("AAPL")
 """
 
 import asyncio
-import logging
 from pathlib import Path
 
 # 加载 .env 文件
 from dotenv import load_dotenv
 
 from agents_client.db_polling.db_client import TradingAgentClientDB
+from agents_client.utils import require_access_token
 
 env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(env_path)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(name)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 # ==================== 命令行入口 ====================
@@ -124,8 +118,6 @@ async def main(agent_url, stock_code, a2a_token, task_id=None):
 
 
 if __name__ == "__main__":
-    import os
-
     # agent_url = 'http://localhost:9999'  # 本地测试
     agent_url = 'http://127.0.0.1:8000/api/v1/agents/69/a2a/'  # 云端模式
 
@@ -135,9 +127,6 @@ if __name__ == "__main__":
     task_id = None
 
     # 从 .env 读取 token
-    a2a_token = os.getenv('FINTOOLS_ACCESS_TOKEN', '')
-
-    if not a2a_token:
-        raise ValueError("FINTOOLS_ACCESS_TOKEN not found in .env")
+    a2a_token = require_access_token()
 
     asyncio.run(main(agent_url, stock_code, a2a_token, task_id))

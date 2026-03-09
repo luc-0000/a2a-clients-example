@@ -7,7 +7,7 @@ Trading Agent Client
 import asyncio
 import sys
 from agents_client.streaming.base_client import A2AAgentClient
-from agents_client.utils import ReportDownloader
+from agents_client.utils import ReportDownloader, normalize_agent_base_url, require_access_token
 
 
 # ========================================
@@ -60,7 +60,6 @@ async def run_trading_agent(stock_code: str, agent_url: str, a2a_token: str = No
 # ========================================
 
 if __name__ == "__main__":
-    import os
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -71,25 +70,16 @@ if __name__ == "__main__":
     agent_url = args[1] if len(args) > 1 else DEFAULT_AGENT_URL
 
     # 后端模式：需要 token
-    a2a_token = os.getenv("FINTOOLS_ACCESS_TOKEN")
-    if not a2a_token:
-        print("❌ 错误: 未设置 FINTOOLS_ACCESS_TOKEN 环境变量")
-        print("\n请在 .env 文件中设置:")
-        print("  FINTOOLS_ACCESS_TOKEN=your-token-here")
-        print("\n或通过命令行设置:")
-        print("  export FINTOOLS_ACCESS_TOKEN=your-token-here")
-        sys.exit(1)
+    a2a_token = require_access_token()
 
     print(f"🔗 后端模式: {agent_url}")
 
     # 运行 + 显示 + 下载
-    success = asyncio.run(run_trading_agent(stock_code, agent_url, a2a_token))
+    asyncio.run(run_trading_agent(stock_code, agent_url, a2a_token))
     
     # 报告下载器（streaming 模式通过 Backend 时需要正确的路径）
     # 从 agent_url 提取 base URL（去掉 /a2a/ 部分）
-    report_base_url = agent_url.rstrip("/")
-    if report_base_url.endswith("/a2a"):
-        report_base_url = report_base_url[:-4]
+    report_base_url = normalize_agent_base_url(agent_url)
     
     manager = ReportDownloader(
         report_base_url,

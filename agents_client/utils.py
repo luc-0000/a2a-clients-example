@@ -6,12 +6,35 @@ A2A Agent Client 公共工具
 """
 
 import logging
+import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_agent_base_url(agent_url: str) -> str:
+    """标准化 agent 基础地址：去掉末尾斜杠和 /a2a。"""
+    normalized = agent_url.rstrip("/")
+    if normalized.endswith("/a2a"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def require_access_token(env_var: str = "FINTOOLS_ACCESS_TOKEN") -> str:
+    """读取并校验访问 token，不存在则打印提示并退出。"""
+    token = os.getenv(env_var)
+    if token:
+        return token
+    print(f"❌ 错误: 未设置 {env_var} 环境变量")
+    print("\n请在 .env 文件中设置:")
+    print(f"  {env_var}=your-token-here")
+    print("\n或通过命令行设置:")
+    print(f"  export {env_var}=your-token-here")
+    sys.exit(1)
 
 
 class ReportDownloader:
@@ -46,14 +69,15 @@ class ReportDownloader:
         self.reports_url = f"{self.agent_url}/{reports_path}"
         self.reports_zip_url = f"{self.agent_url}/{reports_zip_path}"
 
+    def _auth_headers(self) -> dict:
+        if not self.a2a_token:
+            return {}
+        return {"Authorization": f"Bearer {self.a2a_token}"}
+
     async def list_reports(self) -> list:
         """获取报告列表"""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            headers = {}
-            if self.a2a_token:
-                headers["Authorization"] = f"Bearer {self.a2a_token}"
-                
-            response = await client.get(self.reports_url, headers=headers)
+            response = await client.get(self.reports_url, headers=self._auth_headers())
 
             if response.status_code != 200:
                 logger.error(f"获取报告列表失败: {response.status_code}")
@@ -102,15 +126,11 @@ class ReportDownloader:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            headers = {}
-            if self.a2a_token:
-                headers["Authorization"] = f"Bearer {self.a2a_token}"
-                
             print(f"正在下载 ZIP 包...")
             print(f"  URL: {self.reports_zip_url}")
 
             try:
-                response = await client.get(self.reports_zip_url, headers=headers)
+                response = await client.get(self.reports_zip_url, headers=self._auth_headers())
                 
                 # 处理特定的错误状态码
                 if response.status_code == 410:

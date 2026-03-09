@@ -15,7 +15,7 @@ from typing import Dict, Any
 
 import httpx
 
-from agents_client.utils import ReportDownloader
+from agents_client.utils import ReportDownloader, normalize_agent_base_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +46,6 @@ class DatabaseAgentClient:
         self.heartbeat_timeout = heartbeat_timeout
         self.max_wait = max_wait
         self.timeout = timeout
-        self.a2a_token = a2a_token
         
         # 构建 headers
         self.headers = {}
@@ -56,21 +55,35 @@ class DatabaseAgentClient:
         # 从 agent_url 提取 task_url（去掉 /a2a/ 部分）
         # agent_url: http://xxx/api/v1/agents/69/a2a/
         # task_url:  http://xxx/api/v1/agents/69/
-        self.task_url = self.agent_url.rstrip("/")
-        if self.task_url.endswith("/a2a"):
-            self.task_url = self.task_url[:-4]
+        self.task_url = normalize_agent_base_url(self.agent_url)
+
+    @staticmethod
+    def _parse_utc_time(iso_time: str | None) -> datetime | None:
+        """解析 ISO 时间，若无时区则按 UTC 处理。"""
+        if not iso_time:
+            return None
+        parsed = datetime.fromisoformat(iso_time)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _age_seconds(self, iso_time: str | None) -> float | None:
+        """返回给定时间距当前 UTC 的秒数。"""
+        parsed = self._parse_utc_time(iso_time)
+        if not parsed:
+            return None
+        return (datetime.now(timezone.utc) - parsed).total_seconds()
         
-    async def submit_task(self, agent_args: dict, mode: str = "db_polling") -> str:
+    async def submit_task(self, agent_args: dict) -> str:
         """提交任务，返回 task_id
         
         Args:
             agent_args: Agent 参数
-            mode: Server 模式 (streaming | db_polling)，默认 db_polling
         """
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{self.agent_url}/api/tasks",
-                json={"mode": mode, "agent_args": agent_args},
+                json={"mode": "db_polling", "agent_args": agent_args},
                 headers=self.headers
             )
             response.raise_for_status()
@@ -104,26 +117,8 @@ class DatabaseAgentClient:
         """打印任务状态"""
         status = task.get("status", "unknown")
         progress = task.get("progress", "")
-        heartbeat_at = task.get("heartbeat_at")
-        updated_at = task.get("updated_at")
-        
-        # 计算心跳时间差（使用 UTC 时间）
-        heartbeat_age = None
-        if heartbeat_at:
-            heartbeat_time = datetime.fromisoformat(heartbeat_at)
-            # 如果时间没有时区信息，假设是 UTC
-            if heartbeat_time.tzinfo is None:
-                heartbeat_time = heartbeat_time.replace(tzinfo=timezone.utc)
-            heartbeat_age = (datetime.now(timezone.utc) - heartbeat_time).total_seconds()
-            
-        # 计算更新时间差（使用 UTC 时间）
-        updated_age = None
-        if updated_at:
-            updated_time = datetime.fromisoformat(updated_at)
-            # 如果时间没有时区信息，假设是 UTC
-            if updated_time.tzinfo is None:
-                updated_time = updated_time.replace(tzinfo=timezone.utc)
-            updated_age = (datetime.now(timezone.utc) - updated_time).total_seconds()
+        heartbeat_age = self._age_seconds(task.get("heartbeat_at"))
+        updated_age = self._age_seconds(task.get("updated_at"))
         
         print(f"\n[轮询 #{poll_count}] {datetime.now().strftime('%H:%M:%S')}")
         print(f"  状态: {status}")
@@ -177,11 +172,7 @@ class DatabaseAgentClient:
             
         print(f"\n{'='*60}\n")
         
-    async def wait_for_task(
-        self,
-        task_id: str,
-        on_status_update: callable = None
-    ) -> Dict[str, Any]:
+    async def wait_for_task(self, task_id: str) -> Dict[str, Any]:
         """
         等待任务完成
         
@@ -201,31 +192,16 @@ class DatabaseAgentClient:
             # 打印状态
             self._print_task_status(task, poll_count)
             
-            # 回调（可选）
-            if on_status_update:
-                await on_status_update(task)
-            
             # 检查是否完成
-            if status == "completed":
-                self._print_final_result(task)
-                return task
-                
-            if status == "failed":
+            if status in {"completed", "failed"}:
                 self._print_final_result(task)
                 return task
             
             # 检查心跳超时（Server 可能挂了）
             # 但只在任务未完成时才检查心跳
-            heartbeat_at = task.get("heartbeat_at")
-            if heartbeat_at:
-                heartbeat_time = datetime.fromisoformat(heartbeat_at)
-                # 如果时间没有时区信息，假设是 UTC
-                if heartbeat_time.tzinfo is None:
-                    heartbeat_time = heartbeat_time.replace(tzinfo=timezone.utc)
-                heartbeat_age = (datetime.now(timezone.utc) - heartbeat_time).total_seconds()
-                
-                # 只有在心跳超时且任务状态不是 completed/failed 时才判断超时
-                if heartbeat_age > self.heartbeat_timeout and status not in ["completed", "failed"]:
+            heartbeat_age = self._age_seconds(task.get("heartbeat_at"))
+            if heartbeat_age is not None:
+                if heartbeat_age > self.heartbeat_timeout:
                     print(f"\n⚠ 警告: Server 心跳超时 ({heartbeat_age:.0f}s > {self.heartbeat_timeout}s)")
                     task["status"] = "timeout"
                     task["error"] = f"Server heartbeat timeout: {heartbeat_age:.0f}s"
@@ -245,17 +221,12 @@ class DatabaseAgentClient:
         self._print_final_result(task)
         return task
         
-    async def execute(
-        self,
-        agent_args: dict,
-        on_status_update: callable = None
-    ) -> Dict[str, Any]:
+    async def execute(self, agent_args: dict) -> Dict[str, Any]:
         """
         一站式执行：提交 + 等待
         
         Args:
             agent_args: Agent 参数
-            on_status_update: 状态更新回调（可选）
             
         Returns:
             任务详情
@@ -264,7 +235,7 @@ class DatabaseAgentClient:
         task_id = await self.submit_task(agent_args)
         
         # 等待完成
-        return await self.wait_for_task(task_id, on_status_update)
+        return await self.wait_for_task(task_id)
 
 
 class TradingAgentClientDB(DatabaseAgentClient):
@@ -302,9 +273,7 @@ class TradingAgentClientDB(DatabaseAgentClient):
         # 报告下载器使用统一的 URL（去掉 /a2a/ 部分）
         # agent_url: http://127.0.0.1:8000/api/v1/agents/69/a2a/
         # report_url: http://127.0.0.1:8000/api/v1/agents/69/
-        report_base_url = agent_url.rstrip("/")
-        if report_base_url.endswith("/a2a"):
-            report_base_url = report_base_url[:-4]
+        report_base_url = normalize_agent_base_url(agent_url)
 
         self.report_downloader = ReportDownloader(
             agent_url=report_base_url,
@@ -363,7 +332,3 @@ class TradingAgentClientDB(DatabaseAgentClient):
             下载后的文件路径，失败返回 None
         """
         return await self.report_downloader.download_zip(output_dir)
-
-    async def list_reports(self) -> list:
-        """获取报告列表"""
-        return await self.report_downloader.show_reports()
