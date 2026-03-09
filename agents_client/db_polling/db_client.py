@@ -11,7 +11,7 @@ A2A Agent Client - 数据库模式
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 import httpx
 
@@ -265,43 +265,6 @@ class DatabaseAgentClient:
         
         # 等待完成
         return await self.wait_for_task(task_id, on_status_update)
-        
-    async def list_tasks(self, status: str = None) -> list:
-        """列出任务"""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            params = {}
-            if status:
-                params["status"] = status
-                
-            response = await client.get(
-                f"{self.agent_url}/api/tasks",
-                params=params
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            tasks = data.get("tasks", [])
-            
-            print(f"\n{'='*60}")
-            print(f"任务列表 ({len(tasks)} 个)")
-            print(f"{'='*60}")
-            
-            for task in tasks:
-                task_id = task.get("task_id", "unknown")
-                status = task.get("status", "unknown")
-                progress = task.get("progress", "")
-                created_at = task.get("created_at", "")
-                
-                print(f"\nTask: {task_id}")
-                print(f"  状态: {status}")
-                if progress:
-                    print(f"  进度: {progress}")
-                if created_at:
-                    print(f"  创建: {created_at}")
-                    
-            print(f"\n{'='*60}\n")
-            
-            return tasks
 
 
 class TradingAgentClientDB(DatabaseAgentClient):
@@ -354,8 +317,6 @@ class TradingAgentClientDB(DatabaseAgentClient):
     async def analyze_stock(
             self,
             stock_code: str,
-            depth: str = "quick",
-            query: str = None,
             download_reports: bool = True
     ):
         """
@@ -363,8 +324,6 @@ class TradingAgentClientDB(DatabaseAgentClient):
 
         Args:
             stock_code: 股票代码（如 "AAPL" 或 "000001.SZ"）
-            depth: 分析深度（"quick" 或 "deep"）
-            query: 自定义查询（可选）
             download_reports: 是否自动下载报告（默认 True）
 
         Returns:
@@ -408,88 +367,3 @@ class TradingAgentClientDB(DatabaseAgentClient):
     async def list_reports(self) -> list:
         """获取报告列表"""
         return await self.report_downloader.show_reports()
-
-    async def batch_analyze(
-            self,
-            symbols: list,
-            depth: str = "quick"
-    ):
-        """
-        批量分析股票
-
-        Args:
-            symbols: 股票代码列表
-            depth: 分析深度
-
-        Returns:
-            结果列表
-        """
-        logger.info(f"[TradingAgent] Batch analyzing {len(symbols)} stocks")
-
-        # 提交所有任务
-        task_ids = []
-        for symbol in symbols:
-            task_id = await self.submit_task({
-                "symbol": symbol,
-                "depth": depth,
-                "query": f"分析 {symbol} 股票"
-            })
-            task_ids.append((symbol, task_id))
-
-        # 等待所有任务完成
-        results = []
-        for symbol, task_id in task_ids:
-            logger.info(f"[TradingAgent] Waiting for {symbol}...")
-            result = await self.wait_for_task(task_id)
-            results.append({
-                "symbol": symbol,
-                "task_id": task_id,
-                "result": result
-            })
-
-        return results
-
-
-# ==================== 命令行入口 ====================
-
-async def main():
-    """测试用例"""
-    import sys
-    
-    # 默认参数
-    agent_url = "http://localhost:9999"
-    
-    # 从命令行读取
-    if len(sys.argv) > 1:
-        agent_url = sys.argv[1]
-        
-    print(f"\n{'='*60}")
-    print(f"A2A Agent Client (Database Mode)")
-    print(f"{'='*60}")
-    print(f"Agent URL: {agent_url}")
-    print(f"轮询间隔: 30 秒")
-    print(f"心跳超时: 90 秒")
-    print(f"{'='*60}\n")
-    
-    client = DatabaseAgentClient(
-        agent_url=agent_url,
-        poll_interval=30.0,
-        heartbeat_timeout=90.0,
-        max_wait=3600.0
-    )
-    
-    # 执行任务
-    result = await client.execute(
-        agent_args={
-            "query": "测试任务",
-            "depth": "quick"
-        }
-    )
-    
-    print(f"\n最终状态: {result.get('status')}")
-    if result.get("result"):
-        print(f"结果长度: {len(result['result'])} 字符")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
