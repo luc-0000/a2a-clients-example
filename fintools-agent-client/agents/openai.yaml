@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fintools Agent Client"
+  short_description: "Run Fintools agent clients in an isolated temp workspace"
+  default_prompt: "Use $fintools-agent-client to run a Fintools agent client with a temporary workspace and persistent outputs."
