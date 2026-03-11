@@ -1,6 +1,8 @@
 import importlib.util
 import os
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -34,6 +36,49 @@ class RunAgentClientTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.module.normalize_mode("recoverable_polling")
 
+    def test_skill_root_contains_bundled_runtime_files(self):
+        self.assertTrue(self.module.AGENTS_CLIENT_DIR.is_dir())
+        self.assertTrue(self.module.REQUIREMENTS_FILE.is_file())
+
+    def test_validate_skill_layout_fails_cleanly_when_bundled_files_missing(self):
+        with mock.patch.object(self.module, "AGENTS_CLIENT_DIR", Path("/tmp/missing-agents-client")), \
+             mock.patch.object(self.module, "REQUIREMENTS_FILE", Path("/tmp/missing-requirements.txt")):
+            with self.assertRaises(SystemExit):
+                self.module.validate_skill_layout()
+
+    def test_standalone_skill_copy_imports_without_parent_repo(self):
+        skill_root = MODULE_PATH.parents[1]
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-standalone-") as tmpdir:
+            copied_root = Path(tmpdir) / "fintools-agent-client"
+            shutil.copytree(skill_root, copied_root)
+            copied_module_path = copied_root / "scripts" / "run_agent_client.py"
+            spec = importlib.util.spec_from_file_location("standalone_run_agent_client", copied_module_path)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
+
+            self.assertEqual(module.SKILL_ROOT.resolve(), copied_root.resolve())
+            self.assertTrue(module.AGENTS_CLIENT_DIR.is_dir())
+            self.assertTrue(module.REQUIREMENTS_FILE.is_file())
+
+    def test_token_file_path(self):
+        self.assertEqual(
+            self.module.token_file_path("/tmp/example-parent"),
+            Path("/tmp/example-parent/.fintools_access_token"),
+        )
+
+    def test_save_and_load_cached_access_token(self):
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-token-") as tmpdir:
+            self.module.save_access_token(tmpdir, "secret-token")
+            self.assertEqual(self.module.load_cached_access_token(tmpdir), "secret-token")
+
+    def test_resolve_access_token_uses_cache(self):
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-token-") as tmpdir:
+            self.module.save_access_token(tmpdir, "cached-token")
+            args = type("Args", (), {"access_token": None})()
+            with mock.patch.dict(self.module.os.environ, {}, clear=True):
+                self.assertEqual(self.module.resolve_access_token(args, tmpdir), "cached-token")
+
     def test_ensure_required_rejects_missing_agent_url(self):
         args = type(
             "Args",
@@ -50,11 +95,44 @@ class RunAgentClientTests(unittest.TestCase):
 
     def test_auto_work_dir_prefix_contains_skill_name(self):
         work_dir, auto_created = self.module.ensure_work_dir(None)
-        try:
-            self.assertTrue(auto_created)
-            self.assertTrue(Path(work_dir).name.startswith("fintools-agent-client-run-"))
-        finally:
-            Path(work_dir).rmdir()
+        self.assertTrue(auto_created)
+        self.assertEqual(Path(work_dir).name, "fintools-agent-client-runs")
+
+    def test_auto_work_dir_prefers_tmp_when_available(self):
+        with mock.patch.object(self.module.os, "access", return_value=True):
+            work_dir, auto_created = self.module.ensure_work_dir(None)
+        self.assertTrue(auto_created)
+        self.assertEqual(Path(work_dir).parent, Path("/tmp"))
+
+    def test_create_run_dir_under_parent(self):
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-parent-") as tmpdir:
+            run_dir = self.module.create_run_dir(tmpdir)
+            self.assertEqual(Path(run_dir).parent, Path(tmpdir))
+            self.assertTrue(Path(run_dir).name.startswith("run-"))
+
+    def test_shared_runtime_dir_for_venv(self):
+        runtime = {"type": "venv", "detail": "current:{0}".format(sys.executable), "python": sys.executable}
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-parent-") as tmpdir:
+            env_dir = self.module.shared_runtime_dir(tmpdir, runtime)
+            self.assertEqual(Path(env_dir).parent.name, "shared-envs")
+            self.assertTrue(Path(env_dir).name.startswith("venv-py"))
+
+    def test_shared_runtime_dir_for_conda(self):
+        runtime = {"type": "conda", "detail": "conda:/usr/bin/conda", "python": "/usr/bin/conda"}
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-parent-") as tmpdir:
+            env_dir = self.module.shared_runtime_dir(tmpdir, runtime)
+            self.assertEqual(Path(env_dir).parent.name, "shared-envs")
+            self.assertTrue(Path(env_dir).name.startswith("conda-py310-"))
+
+    def test_runtime_ready_marker_path(self):
+        marker = self.module.runtime_ready_marker("/tmp/example-env")
+        self.assertEqual(marker, Path("/tmp/example-env/.ready"))
+
+    def test_log_file_path(self):
+        self.assertEqual(
+            self.module.log_file_path("/tmp/example-run"),
+            Path("/tmp/example-run/run.log"),
+        )
 
     def test_build_reexec_args_preserves_polling_mode(self):
         args = type(
@@ -66,7 +144,6 @@ class RunAgentClientTests(unittest.TestCase):
                 "stock_code": "600519",
                 "agent_url": "http://example.com/a2a/",
                 "access_token": None,
-                "persist_dir": None,
                 "task_id": None,
                 "cleanup": False,
             },
@@ -80,9 +157,10 @@ class RunAgentClientTests(unittest.TestCase):
             with mock.patch.object(self.module, "parse_args") as mock_parse_args, \
                  mock.patch.object(self.module, "resolve_access_token", return_value="token"), \
                  mock.patch.object(self.module, "ensure_work_dir", return_value=(Path(tmpdir), True)), \
+                 mock.patch.object(self.module, "create_run_dir", return_value=Path(tmpdir) / "run-20260312-abcdef"), \
                  mock.patch.object(self.module, "find_python_runtime", return_value={"type": "venv", "detail": "current:/usr/bin/python3", "python": "/usr/bin/python3"}), \
                  mock.patch.object(self.module, "print_runtime_banner"), \
-                 mock.patch.object(self.module, "prepare_runtime", return_value="/tmp/fake-python"), \
+                 mock.patch.object(self.module, "prepare_runtime", return_value=("/tmp/fake-python", "/tmp/fintools-agent-client-runs/shared-envs/venv-py311-deadbeef")), \
                  mock.patch.object(self.module.subprocess, "run") as mock_subprocess_run:
                 mock_parse_args.return_value = type(
                     "Args",
@@ -94,7 +172,6 @@ class RunAgentClientTests(unittest.TestCase):
                         "agent_url": "http://example.com/a2a/",
                         "access_token": None,
                         "work_dir": None,
-                        "persist_dir": None,
                         "task_id": None,
                         "cleanup": False,
                         "_in_env": False,
@@ -109,6 +186,7 @@ class RunAgentClientTests(unittest.TestCase):
                 called_args = mock_subprocess_run.call_args.kwargs["env"]
                 called_cmd = mock_subprocess_run.call_args.args[0]
                 self.assertEqual(called_args["PYTHONUNBUFFERED"], "1")
+                self.assertEqual(called_args["FINTOOLS_RUNTIME_ENV_DIR"], "/tmp/fintools-agent-client-runs/shared-envs/venv-py311-deadbeef")
                 self.assertEqual(called_cmd[1], "-u")
 
 

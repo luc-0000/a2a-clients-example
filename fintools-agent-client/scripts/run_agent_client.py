@@ -3,19 +3,54 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from datetime import datetime
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_NAME = "fintools-agent-client"
-TEMP_PREFIX = "{0}-run-".format(SKILL_NAME)
+DEFAULT_PARENT_DIRNAME = "{0}-runs".format(SKILL_NAME)
+RUN_PREFIX = "run-"
 SUMMARY_NAME = "summary.json"
+LOG_NAME = "run.log"
+SHARED_ENVS_DIRNAME = "shared-envs"
+LOCK_POLL_INTERVAL = 0.2
+LOCK_TIMEOUT_SECONDS = 300
+TOKEN_FILENAME = ".fintools_access_token"
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_ROOT = SCRIPT_DIR.parent
+AGENTS_CLIENT_DIR = SKILL_ROOT / "agents_client"
+REQUIREMENTS_FILE = SKILL_ROOT / "requirements.txt"
+
+
+def fail(message, exit_code=2):
+    print("ERROR: {0}".format(message), file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def validate_skill_layout():
+    missing = []
+    if not AGENTS_CLIENT_DIR.is_dir():
+        missing.append("agents_client/")
+    if not REQUIREMENTS_FILE.is_file():
+        missing.append("requirements.txt")
+    if missing:
+        fail(
+            "The skill is incomplete. Missing required bundled files under {0}: {1}".format(
+                SKILL_ROOT, ", ".join(missing)
+            )
+        )
+
+
+validate_skill_layout()
 
 
 def parse_args():
@@ -29,18 +64,11 @@ def parse_args():
     parser.add_argument("--agent-url")
     parser.add_argument("--access-token")
     parser.add_argument("--work-dir")
-    parser.add_argument("--persist-dir")
     parser.add_argument("--task-id")
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--_in-env", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_work-dir-auto-created", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
-
-
-def fail(message, exit_code=2):
-    print("ERROR: {0}".format(message), file=sys.stderr)
-    raise SystemExit(exit_code)
-
 
 def ensure_required(args):
     missing = []
@@ -67,10 +95,36 @@ def normalize_mode(mode):
     return normalized
 
 
-def resolve_access_token(args):
+def token_file_path(parent_dir):
+    return Path(parent_dir) / TOKEN_FILENAME
+
+
+def load_cached_access_token(parent_dir):
+    token_path = token_file_path(parent_dir)
+    if token_path.is_file():
+        token = token_path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    return None
+
+
+def save_access_token(parent_dir, token):
+    token_path = token_file_path(parent_dir)
+    token_path.write_text(token.strip() + "\n", encoding="utf-8")
+    try:
+        os.chmod(token_path, 0o600)
+    except OSError:
+        pass
+
+
+def resolve_access_token(args, parent_dir=None):
     token = args.access_token or os.environ.get("FINTOOLS_ACCESS_TOKEN")
+    if not token and parent_dir is not None:
+        token = load_cached_access_token(parent_dir)
     if not token:
         fail("Missing FINTOOLS_ACCESS_TOKEN. Pass --access-token or set the environment variable.")
+    if parent_dir is not None and token:
+        save_access_token(parent_dir, token)
     return token
 
 
@@ -128,38 +182,136 @@ def find_python_runtime():
     fail("No compatible Python 3.10+ interpreter or conda executable was found.")
 
 
+def create_run_dir(parent_dir):
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix = "{0:06x}".format(random.randrange(16 ** 6))
+    run_dir = Path(parent_dir) / "{0}{1}-{2}".format(RUN_PREFIX, timestamp, suffix)
+    run_dir.mkdir(parents=False, exist_ok=False)
+    return run_dir
+
+
+def shared_envs_dir(parent_dir):
+    path = Path(parent_dir) / SHARED_ENVS_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def ensure_work_dir(raw_work_dir):
     if raw_work_dir:
-        work_dir = Path(raw_work_dir).expanduser().resolve()
-        work_dir.mkdir(parents=True, exist_ok=True)
-        return work_dir, False
+        parent_dir = Path(raw_work_dir).expanduser().resolve()
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        return parent_dir, False
 
-    work_dir = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
-    return work_dir, True
+    tmp_root = Path("/tmp")
+    if tmp_root.exists() and tmp_root.is_dir() and os.access(tmp_root, os.W_OK | os.X_OK):
+        parent_dir = tmp_root / DEFAULT_PARENT_DIRNAME
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        return parent_dir, True
+
+    parent_dir = Path(tempfile.gettempdir()) / DEFAULT_PARENT_DIRNAME
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    return parent_dir, True
 
 
 def run_command(cmd, env=None, cwd=None):
     subprocess.run(cmd, check=True, env=env, cwd=str(cwd) if cwd else None)
 
 
-def prepare_runtime(runtime, work_dir):
+def requirements_fingerprint():
+    requirements_bytes = REQUIREMENTS_FILE.read_bytes()
+    return hashlib.sha256(requirements_bytes).hexdigest()[:12]
+
+
+def runtime_version_tag(runtime):
+    if runtime["type"] == "venv":
+        version = version_for(runtime["python"])
+        if not version:
+            fail("Unable to determine Python version for shared venv runtime.")
+        return "py{0}{1}".format(version[0], version[1])
+    return "py310"
+
+
+def acquire_lock(lock_path):
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            return
+        except FileExistsError:
+            if time.time() - start > LOCK_TIMEOUT_SECONDS:
+                fail("Timed out waiting for environment lock: {0}".format(lock_path))
+            time.sleep(LOCK_POLL_INTERVAL)
+
+
+def release_lock(lock_path):
+    try:
+        Path(lock_path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def shared_runtime_dir(parent_dir, runtime):
+    shared_root = shared_envs_dir(parent_dir)
+    fingerprint = requirements_fingerprint()
+    version_tag = runtime_version_tag(runtime)
+    env_prefix = "venv" if runtime["type"] == "venv" else "conda"
+    return shared_root / "{0}-{1}-{2}".format(env_prefix, version_tag, fingerprint)
+
+
+def runtime_ready_marker(env_dir):
+    return Path(env_dir) / ".ready"
+
+
+def log_file_path(work_dir):
+    return Path(work_dir) / LOG_NAME
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return False
+
+
+def prepare_runtime(runtime, parent_dir):
     base_env = os.environ.copy()
     base_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    env_dir = shared_runtime_dir(parent_dir, runtime)
+    lock_path = "{0}.lock".format(env_dir)
+    acquire_lock(lock_path)
+    try:
+        if runtime["type"] == "venv":
+            python_path = env_dir / "bin" / "python"
+            ready_marker = runtime_ready_marker(env_dir)
+            if not python_path.exists():
+                run_command([runtime["python"], "-m", "venv", str(env_dir)], env=base_env)
+            if not ready_marker.exists():
+                run_command([str(python_path), "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)], env=base_env)
+                ready_marker.write_text("ok\n")
+            return str(python_path), str(env_dir)
 
-    if runtime["type"] == "venv":
-        venv_dir = work_dir / ".venv"
-        python_path = venv_dir / "bin" / "python"
+        python_path = env_dir / "bin" / "python"
+        ready_marker = runtime_ready_marker(env_dir)
         if not python_path.exists():
-            run_command([runtime["python"], "-m", "venv", str(venv_dir)], env=base_env)
-        run_command([str(python_path), "-m", "pip", "install", "-r", str(REPO_ROOT / "requirements.txt")], env=base_env)
-        return str(python_path)
-
-    env_dir = work_dir / "conda-env"
-    python_path = env_dir / "bin" / "python"
-    if not python_path.exists():
-        run_command([runtime["python"], "create", "-y", "-p", str(env_dir), "python=3.10"], env=base_env)
-    run_command([str(python_path), "-m", "pip", "install", "-r", str(REPO_ROOT / "requirements.txt")], env=base_env)
-    return str(python_path)
+            run_command([runtime["python"], "create", "-y", "-p", str(env_dir), "python=3.10"], env=base_env)
+        if not ready_marker.exists():
+            run_command([str(python_path), "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)], env=base_env)
+            ready_marker.write_text("ok\n")
+        return str(python_path), str(env_dir)
+    finally:
+        release_lock(lock_path)
 
 
 def build_reexec_args(args, work_dir, auto_created):
@@ -175,8 +327,6 @@ def build_reexec_args(args, work_dir, auto_created):
         argv.append("--_work-dir-auto-created")
     if args.access_token:
         argv.extend(["--access-token", args.access_token])
-    if args.persist_dir:
-        argv.extend(["--persist-dir", args.persist_dir])
     if args.task_id:
         argv.extend(["--task-id", args.task_id])
     if args.cleanup:
@@ -216,38 +366,11 @@ async def run_polling_trading(stock_code, agent_url, token, task_id):
     return result
 
 
-def persist_outputs(work_dir, persist_dir):
-    if not persist_dir:
-        return None
-
-    target = Path(persist_dir).expanduser().resolve()
-    target.mkdir(parents=True, exist_ok=True)
-
-    summary_src = work_dir / SUMMARY_NAME
-    if summary_src.exists():
-        shutil.copy2(summary_src, target / SUMMARY_NAME)
-
-    reports_src = work_dir / "downloaded_reports"
-    if reports_src.exists():
-        reports_dst = target / "downloaded_reports"
-        if reports_dst.exists():
-            shutil.rmtree(reports_dst)
-        shutil.copytree(reports_src, reports_dst)
-
-    return str(target)
-
-
-def maybe_cleanup(work_dir, auto_created, cleanup_requested, persisted):
+def maybe_cleanup(work_dir, cleanup_requested):
     if not cleanup_requested:
         return False
-    if not auto_created:
-        print("Cleanup skipped: work_dir was user-provided.")
-        return False
-    if not persisted:
-        print("Cleanup skipped: outputs were not persisted.")
-        return False
     shutil.rmtree(work_dir, ignore_errors=True)
-    print("Cleaned up auto-created work directory: {0}".format(work_dir))
+    print("Cleaned up run directory: {0}".format(work_dir))
     return True
 
 
@@ -257,45 +380,60 @@ def write_summary(work_dir, payload):
     return summary_path
 
 
-def print_runtime_banner(work_dir, auto_created, runtime):
-    source = "auto-created temporary directory" if auto_created else "user-provided directory"
-    print("Working directory: {0}".format(work_dir))
-    print("Working directory source: {0}".format(source))
+def print_runtime_banner(parent_dir, work_dir, parent_auto_created, runtime, runtime_env_dir):
+    source = "auto-created parent directory" if parent_auto_created else "user-provided parent directory"
+    print("Parent directory: {0}".format(parent_dir))
+    print("Parent directory source: {0}".format(source))
+    print("Run directory: {0}".format(work_dir))
     print("Runtime type: {0}".format(runtime["type"]))
     print("Runtime detail: {0}".format(runtime["detail"]))
+    print("Shared runtime directory: {0}".format(runtime_env_dir))
 
 
 async def run_inside_env(args):
     token = resolve_access_token(args)
     work_dir = Path(args.work_dir).resolve()
-    auto_created = args._work_dir_auto_created
+    parent_auto_created = args._work_dir_auto_created
     reports_dir = work_dir / "downloaded_reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
+    run_log = log_file_path(work_dir)
 
     os.chdir(str(work_dir))
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
+    if str(SKILL_ROOT) not in sys.path:
+        sys.path.insert(0, str(SKILL_ROOT))
 
     error = None
     success = False
     report_path = None
-
-    try:
-        if args.mode == "streaming" and args.agent_type == "deep_research":
-            success, report_path = await run_streaming_deep_research(args.stock_code, args.agent_url, token, str(reports_dir))
-        elif args.mode == "streaming" and args.agent_type == "trading":
-            success, report_path = await run_streaming_trading(args.stock_code, args.agent_url, token, str(reports_dir))
-        elif args.mode == "polling" and args.agent_type == "trading":
-            result = await run_polling_trading(args.stock_code, args.agent_url, token, args.task_id)
-            success = result.get("status") == "completed"
-            report_path = result.get("downloaded_file")
-            error = result.get("error")
-        else:
-            fail("The repository does not implement polling for deep_research.")
-    except SystemExit:
-        raise
-    except Exception as exc:
-        error = str(exc)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    with run_log.open("a", encoding="utf-8") as log_handle:
+        tee_stdout = TeeStream(original_stdout, log_handle)
+        tee_stderr = TeeStream(original_stderr, log_handle)
+        sys.stdout = tee_stdout
+        sys.stderr = tee_stderr
+        try:
+            print("Run log: {0}".format(run_log), flush=True)
+            if args.mode == "streaming" and args.agent_type == "deep_research":
+                success, report_path = await run_streaming_deep_research(args.stock_code, args.agent_url, token, str(reports_dir))
+            elif args.mode == "streaming" and args.agent_type == "trading":
+                success, report_path = await run_streaming_trading(args.stock_code, args.agent_url, token, str(reports_dir))
+            elif args.mode == "polling" and args.agent_type == "trading":
+                result = await run_polling_trading(args.stock_code, args.agent_url, token, args.task_id)
+                success = result.get("status") == "completed"
+                report_path = result.get("downloaded_file")
+                error = result.get("error")
+            else:
+                fail("The repository does not implement polling for deep_research.")
+        except SystemExit:
+            raise
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            tee_stdout.flush()
+            tee_stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
     summary = {
         "agent_type": args.agent_type,
@@ -304,32 +442,31 @@ async def run_inside_env(args):
         "agent_url": args.agent_url,
         "runtime_type": os.environ.get("FINTOOLS_RUNTIME_TYPE", "unknown"),
         "runtime_detail": os.environ.get("FINTOOLS_RUNTIME_DETAIL", "unknown"),
+        "runtime_env_dir": os.environ.get("FINTOOLS_RUNTIME_ENV_DIR", "unknown"),
         "work_dir": str(work_dir),
-        "work_dir_source": "auto-created" if auto_created else "user-provided",
-        "persist_dir": args.persist_dir,
+        "parent_dir_source": "auto-created" if parent_auto_created else "user-provided",
+        "run_dir": str(work_dir),
+        "log_path": str(run_log),
         "report_path": report_path,
         "success": bool(success),
         "cleanup_requested": bool(args.cleanup),
         "cleanup_performed": False,
         "error": error,
     }
-    summary["persist_dir"] = str(Path(args.persist_dir).expanduser().resolve()) if args.persist_dir else None
     summary_path = write_summary(work_dir, summary)
-    persisted = persist_outputs(work_dir, args.persist_dir)
-    summary["persist_dir"] = persisted or summary["persist_dir"]
-    cleanup_planned = bool(args.cleanup and auto_created and persisted)
+    cleanup_planned = bool(args.cleanup)
     summary["cleanup_performed"] = cleanup_planned
     summary_path = write_summary(work_dir, summary)
-    if persisted:
-        persisted = persist_outputs(work_dir, args.persist_dir)
-    cleanup_performed = maybe_cleanup(work_dir, auto_created, args.cleanup, persisted)
+    cleanup_performed = maybe_cleanup(work_dir, args.cleanup)
 
     if not cleanup_performed:
+        summary["cleanup_performed"] = False
         write_summary(work_dir, summary)
         print("Summary written to: {0}".format(summary_path))
 
     print("Report path: {0}".format(report_path or "none"))
-    print("Persisted outputs: {0}".format(persisted or "not requested"))
+    print("Run log: {0}".format(run_log))
+    print("Run directory: {0}".format(work_dir))
     print("Run success: {0}".format("yes" if success else "no"))
     if error:
         print("Run error: {0}".format(error))
@@ -347,19 +484,21 @@ def main():
     if args._in_env:
         return asyncio.run(run_inside_env(args))
 
-    token = resolve_access_token(args)
-    work_dir, auto_created = ensure_work_dir(args.work_dir)
+    parent_dir, parent_auto_created = ensure_work_dir(args.work_dir)
+    token = resolve_access_token(args, parent_dir)
+    work_dir = create_run_dir(parent_dir)
     runtime = find_python_runtime()
-    print_runtime_banner(work_dir, auto_created, runtime)
+    env_python, runtime_env_dir = prepare_runtime(runtime, parent_dir)
+    print_runtime_banner(parent_dir, work_dir, parent_auto_created, runtime, runtime_env_dir)
 
-    env_python = prepare_runtime(runtime, work_dir)
     child_env = os.environ.copy()
     child_env["FINTOOLS_ACCESS_TOKEN"] = token
     child_env["FINTOOLS_RUNTIME_TYPE"] = runtime["type"]
     child_env["FINTOOLS_RUNTIME_DETAIL"] = runtime["detail"]
+    child_env["FINTOOLS_RUNTIME_ENV_DIR"] = runtime_env_dir
     child_env["PYTHONUNBUFFERED"] = "1"
 
-    child_args = [env_python, "-u", str(Path(__file__).resolve())] + build_reexec_args(args, work_dir, auto_created)
+    child_args = [env_python, "-u", str(Path(__file__).resolve())] + build_reexec_args(args, work_dir, parent_auto_created)
     completed = subprocess.run(child_args, env=child_env)
     return completed.returncode
 

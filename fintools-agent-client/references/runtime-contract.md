@@ -8,23 +8,43 @@ This skill wraps the repository's existing client modules so another agent does 
 - manually create a working directory
 - manually switch between streaming and polling code paths
 - manually preserve outputs for the user
+- manually reconstruct anything from the original repository after copying the skill
 
 ## Working Directory Rules
 
-- Use the provided `work_dir` when present.
-- Otherwise create an auto-named temporary directory with the skill name in the prefix.
-- Write the environment, `summary.json`, and `downloaded_reports/` into that directory.
-- Do not delete a user-provided working directory automatically.
-- Delete an auto-created directory only when:
-  - the user explicitly requested cleanup
-  - outputs were already copied to `persist_dir`
+- Use the provided `work_dir` as the parent directory when present.
+- Otherwise use `/tmp/fintools-agent-client-runs/` as the default parent directory when available.
+- If `/tmp` is unavailable, fall back to the system temp root.
+- Keep shared environments under the parent directory, for example `shared-envs/`.
+- Keep the cached access token in the parent directory as `.fintools_access_token`.
+- Create a unique `run-*` subdirectory for each execution.
+- Write the environment, `summary.json`, `run.log`, and `downloaded_reports/` into that run subdirectory.
+- Do not delete the parent directory automatically.
+- Delete only the current run subdirectory when the user explicitly requested cleanup.
+
+## Standalone Layout
+
+- Bundle `agents_client/` inside the skill directory.
+- Bundle `requirements.txt` inside the skill directory.
+- Resolve all runtime paths relative to the skill directory itself.
+- Fail clearly if the bundled runtime files are missing.
 
 ## Runtime Selection Rules
 
 1. Prefer the current interpreter when it is Python 3.10+.
 2. Otherwise search for `python3.10`, `python3.11`, `python3.12`, or `python3.13`.
-3. Only if none exist, fall back to `conda create -p <work-dir>/conda-env python=3.10`.
-4. If conda is unavailable, fail with a direct error.
+3. Reuse a shared `venv` when a compatible interpreter exists.
+4. If no compatible interpreter exists, reuse or create a shared `conda-env`.
+5. Partition shared environments by Python version and dependency fingerprint.
+6. Use a lock to avoid concurrent initialization of the same shared environment.
+7. If conda is unavailable, fail with a direct error.
+
+## Token Reuse Rules
+
+1. Prefer `--access-token` when provided.
+2. Otherwise read `FINTOOLS_ACCESS_TOKEN` from the environment.
+3. Otherwise reuse `.fintools_access_token` from the parent directory.
+4. After obtaining a token from CLI or environment, save it into the parent directory for later runs.
 
 ## Supported Combinations
 
@@ -40,9 +60,10 @@ Do not silently substitute another mode for an unsupported combination.
 
 ## Persistence Rules
 
-- If `persist_dir` is set, copy `summary.json` there.
-- If `downloaded_reports/` exists, copy it there as well.
-- If `persist_dir` is not set, keep the outputs in the working directory and report that path to the user.
+- Keep `summary.json`, `downloaded_reports/`, and runtime artifacts under the same run subdirectory.
+- Mirror terminal stdout/stderr into `run.log` in the same run subdirectory.
+- If the user wants a stable location, they should pass that path as `work_dir`.
+- If `work_dir` is not set, keep the outputs under the auto-created parent directory and report the run subdirectory path to the user.
 
 ## User-Facing Labels
 
@@ -64,8 +85,9 @@ User-facing explanation for polling mode:
 - `runtime_type`
 - `runtime_detail`
 - `work_dir`
-- `work_dir_source`
-- `persist_dir`
+- `parent_dir_source`
+- `run_dir`
+- `log_path`
 - `report_path`
 - `success`
 - `cleanup_requested`
