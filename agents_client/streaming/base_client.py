@@ -1,163 +1,157 @@
 """
-A2A Agent Client 公共模块
-
-提供通用的 Agent 客户端功能：
-- Agent 连接和初始化
-- Stream 处理
+A2A Agent Client - streaming 模式
 """
 
-import logging
 import os
+from pathlib import Path
 from uuid import uuid4
 
 import httpx
 from a2a.client import A2ACardResolver, A2AClient
-from a2a.types import SendStreamingMessageRequest, MessageSendParams
+from a2a.types import MessageSendParams, SendStreamingMessageRequest
+from dotenv import load_dotenv
+
+from agents_client.utils import ReportDownloader, normalize_agent_base_url
 
 
-# ========================================
-# 配置和常量
-# ========================================
-
-DEFAULT_TIMEOUT = httpx.Timeout(
-    connect=10.0,
-    read=None,      # 不超时，适合长时间 streaming
-    write=60.0,
-    pool=60.0
-)
+DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=60.0)
 
 
-# ========================================
-# Agent 客户端
-# ========================================
+def load_project_env(module_file: str) -> None:
+    load_dotenv(Path(module_file).resolve().parents[2] / ".env")
+
 
 class A2AAgentClient:
-    """A2A Agent 客户端基类"""
-
-    def __init__(
-        self,
-        agent_url: str,
-        a2a_token: str = None,
-        timeout: httpx.Timeout = None
-    ):
+    def __init__(self, agent_url: str, a2a_token: str | None = None, timeout: httpx.Timeout | None = None):
         self.agent_url = agent_url
         self.a2a_token = a2a_token or os.getenv("FINTOOLS_ACCESS_TOKEN", "your-secret-token-here")
         self.timeout = timeout or DEFAULT_TIMEOUT
-        self.logger = logging.getLogger(self.__class__.__name__)
-
-        self.httpx_client = None
-        self.agent_card = None
-        self.client = None
+        self.httpx_client: httpx.AsyncClient | None = None
+        self.client: A2AClient | None = None
 
     async def __aenter__(self):
-        """进入异步上下文"""
         self.httpx_client = httpx.AsyncClient(
             timeout=self.timeout,
             headers={
                 "Authorization": f"Bearer {self.a2a_token}",
-                "X-Server-Mode": "streaming"  # 标识 streaming 模式
+                "X-Server-Mode": "streaming",
             },
             trust_env=False,
         )
-
-        # 获取 agent card
-        resolver = A2ACardResolver(httpx_client=self.httpx_client, base_url=self.agent_url)
-        self.agent_card = await resolver.get_agent_card()
-        self.logger.info(f"Agent card fetched: {self.agent_card.name}")
-
-        # 创建 client
-        self.client = A2AClient(
+        agent_card = await A2ACardResolver(
             httpx_client=self.httpx_client,
-            agent_card=self.agent_card,
-            url=self.agent_url
-        )
-        self.logger.info("A2AClient initialized.")
-
+            base_url=self.agent_url,
+        ).get_agent_card()
+        self.client = A2AClient(httpx_client=self.httpx_client, agent_card=agent_card, url=self.agent_url)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """退出异步上下文"""
         if self.httpx_client:
             await self.httpx_client.aclose()
 
     async def send_message_streaming(
         self,
+        *,
         user_message: str,
         agent_args: dict,
-        on_status_update: callable = None,
-        on_artifact_update: callable = None,
-        on_error: callable = None
+        on_status_update=None,
+        on_artifact_update=None,
+        on_error=None,
     ) -> dict:
-        """
-        发送消息并处理 stream 响应
-
-        Args:
-            user_message: 用户消息文本
-            agent_args: Agent 参数
-            on_status_update: 状态更新回调
-            on_artifact_update: artifact 更新回调
-            on_error: 错误回调
-
-        Returns:
-            统计信息: {"event_count": int, "success": bool}
-        """
-        # 构造消息
-        payload = {
-            "message": {
-                "role": "user",
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": user_message,
-                        "metadata": {
-                            "agent_args": agent_args
-                        }
-                    }
-                ],
-                "messageId": uuid4().hex,
-            }
-        }
-
         req = SendStreamingMessageRequest(
             id=str(uuid4()),
-            params=MessageSendParams(**payload),
+            params=MessageSendParams(
+                message={
+                    "role": "user",
+                    "parts": [{
+                        "kind": "text",
+                        "text": user_message,
+                        "metadata": {"agent_args": agent_args},
+                    }],
+                    "messageId": uuid4().hex,
+                }
+            ),
         )
 
         event_count = 0
-        success = True
-
         async for chunk in self.client.send_message_streaming(req):
             event_count += 1
             result = chunk.model_dump(mode="json", exclude_none=True).get("result")
             if not result:
                 continue
+            await self._handle_stream_result(result, on_status_update, on_artifact_update, on_error)
 
-            if result.get("kind") == "status-update":
-                parts = result.get("status", {}).get("message", {}).get("parts", [])
-                for part in parts:
-                    text = part.get("text")
-                    if not text:
-                        continue
+        return {"event_count": event_count, "success": True}
 
-                    if "error" in text.lower() or "异常" in text:
-                        success = False
-                        if on_error:
-                            await on_error(text)
-
-                    if on_status_update:
-                        await on_status_update(text)
-                    else:
-                        print(text)
-                continue
-
-            if result.get("kind") == "artifact-update":
-                artifact = result.get("artifact", {})
-                if on_artifact_update:
-                    await on_artifact_update(artifact)
+    async def _handle_stream_result(self, result: dict, on_status_update, on_artifact_update, on_error) -> None:
+        if result.get("kind") == "status-update":
+            for part in result.get("status", {}).get("message", {}).get("parts", []):
+                text = part.get("text")
+                if not text:
+                    continue
+                if ("error" in text.lower() or "异常" in text) and on_error:
+                    await on_error(text)
+                if on_status_update:
+                    await on_status_update(text)
                 else:
-                    print(f"\n[生成文件] {artifact.get('name', 'unknown')}")
+                    print(text)
+            return
 
-        return {
-            "event_count": event_count,
-            "success": success
-        }
+        if result.get("kind") == "artifact-update":
+            artifact = result.get("artifact", {})
+            if on_artifact_update:
+                await on_artifact_update(artifact)
+            else:
+                print(f"\n[生成文件] {artifact.get('name', 'unknown')}")
+
+
+class StreamingStockAgentClient:
+    def __init__(self, agent_url: str, user_message: str, a2a_token: str | None = None):
+        self.agent_url = agent_url
+        self.user_message = user_message
+        self.a2a_token = a2a_token
+        self.report_downloader = ReportDownloader(
+            normalize_agent_base_url(agent_url),
+            a2a_token,
+            reports_path="reports",
+            reports_zip_path="reports/zip",
+        )
+
+    async def analyze_stock(self, stock_code: str) -> dict:
+        async with A2AAgentClient(self.agent_url, self.a2a_token) as client:
+            return await client.send_message_streaming(
+                user_message=self.user_message.format(stock_code=stock_code),
+                agent_args={"stock_code": stock_code},
+            )
+
+    async def show_reports(self) -> list:
+        return await self.report_downloader.show_reports()
+
+    async def download_reports_zip(self) -> str | None:
+        return await self.report_downloader.download_zip()
+
+
+async def run_stock_agent_client(
+    client_cls: type[StreamingStockAgentClient],
+    title: str,
+    stock_code: str,
+    agent_url: str,
+    a2a_token: str,
+) -> bool:
+    print(f"\n{'=' * 60}")
+    print(f"运行 {title}, May take 30-60s to start server...")
+    print(f"{'=' * 60}")
+    print(f"股票代码: {stock_code}")
+    print(f"Agent地址: {agent_url}")
+    print(f"{'=' * 60}\n")
+
+    client = client_cls(agent_url=agent_url, a2a_token=a2a_token)
+    result = await client.analyze_stock(stock_code)
+
+    print(f"\n{'=' * 60}")
+    print(f"执行完成！共处理 {result['event_count']} 个事件")
+    print(f"{'=' * 60}\n")
+
+    await client.show_reports()
+    await client.download_reports_zip()
+    return result["success"]
