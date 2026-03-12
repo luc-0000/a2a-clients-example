@@ -17,7 +17,7 @@ from datetime import datetime
 
 SKILL_NAME = "fintools-agent-client"
 DEFAULT_PARENT_DIRNAME = "{0}-runs".format(SKILL_NAME)
-RUN_PREFIX = "run-"
+RUN_PREFIX = "{0}-run-".format(SKILL_NAME)
 SUMMARY_NAME = "summary.json"
 LOG_NAME = "run.log"
 SHARED_ENVS_DIRNAME = "shared-envs"
@@ -34,6 +34,14 @@ REQUIREMENTS_FILE = SKILL_ROOT / "requirements.txt"
 def fail(message, exit_code=2):
     print("ERROR: {0}".format(message), file=sys.stderr)
     raise SystemExit(exit_code)
+
+
+def announce_status(message):
+    print("[status] {0}".format(message), flush=True)
+
+
+def announce_result(message):
+    print("[result] {0}".format(message), flush=True)
 
 
 def validate_skill_layout():
@@ -317,25 +325,34 @@ def prepare_runtime(runtime, parent_dir):
     base_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     env_dir = shared_runtime_dir(parent_dir, runtime)
     lock_path = "{0}.lock".format(env_dir)
+    announce_status("正在准备共享运行环境: {0}".format(env_dir))
     acquire_lock(lock_path)
     try:
         if runtime["type"] == "venv":
             python_path = env_dir / "bin" / "python"
             ready_marker = runtime_ready_marker(env_dir)
             if not python_path.exists():
+                announce_status("正在创建共享 venv 环境")
                 run_command([runtime["python"], "-m", "venv", str(env_dir)], env=base_env)
             if not ready_marker.exists():
+                announce_status("正在安装依赖到共享 venv 环境")
                 run_command([str(python_path), "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)], env=base_env)
                 ready_marker.write_text("ok\n")
+            else:
+                announce_status("检测到已就绪的共享 venv 环境，直接复用")
             return str(python_path), str(env_dir)
 
         python_path = env_dir / "bin" / "python"
         ready_marker = runtime_ready_marker(env_dir)
         if not python_path.exists():
+            announce_status("正在创建共享 conda 环境")
             run_command([runtime["python"], "create", "-y", "-p", str(env_dir), "python=3.10"], env=base_env)
         if not ready_marker.exists():
+            announce_status("正在安装依赖到共享 conda 环境")
             run_command([str(python_path), "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)], env=base_env)
             ready_marker.write_text("ok\n")
+        else:
+            announce_status("检测到已就绪的共享 conda 环境，直接复用")
         return str(python_path), str(env_dir)
     finally:
         release_lock(lock_path)
@@ -418,10 +435,12 @@ def print_runtime_banner(parent_dir, work_dir, parent_auto_created, runtime, run
 
 
 async def run_inside_env(args):
+    announce_status("正在读取访问令牌")
     token = resolve_access_token(args)
     work_dir = Path(args.work_dir).resolve()
     parent_auto_created = args._work_dir_auto_created
     reports_dir = work_dir / "downloaded_reports"
+    announce_status("正在准备当前 run 目录")
     reports_dir.mkdir(parents=True, exist_ok=True)
     run_log = log_file_path(work_dir)
 
@@ -440,12 +459,15 @@ async def run_inside_env(args):
         sys.stdout = tee_stdout
         sys.stderr = tee_stderr
         try:
-            print("Run log: {0}".format(run_log), flush=True)
+            announce_status("当前日志文件: {0}".format(run_log))
             if args.mode == "streaming" and args.agent_type == "deep_research":
+                announce_status("正在启动 Deep Research Agent（streaming）")
                 success, report_path = await run_streaming_deep_research(args.stock_code, args.agent_url, token, str(reports_dir))
             elif args.mode == "streaming" and args.agent_type == "trading":
+                announce_status("正在启动 Trading Agent（streaming）")
                 success, report_path = await run_streaming_trading(args.stock_code, args.agent_url, token, str(reports_dir))
             elif args.mode == "polling" and args.agent_type == "trading":
+                announce_status("正在启动 Trading Agent（polling）")
                 result = await run_polling_trading(args.stock_code, args.agent_url, token, args.task_id)
                 success = result.get("status") == "completed"
                 report_path = result.get("downloaded_file")
@@ -483,20 +505,21 @@ async def run_inside_env(args):
     summary_path = write_summary(work_dir, summary)
     cleanup_planned = bool(args.cleanup)
     summary["cleanup_performed"] = cleanup_planned
+    announce_status("正在写入 summary.json")
     summary_path = write_summary(work_dir, summary)
     cleanup_performed = maybe_cleanup(work_dir, args.cleanup)
 
     if not cleanup_performed:
         summary["cleanup_performed"] = False
         write_summary(work_dir, summary)
-        print("Summary written to: {0}".format(summary_path))
+        announce_result("Summary written to: {0}".format(summary_path))
 
-    print("Report path: {0}".format(report_path or "none"))
-    print("Run log: {0}".format(run_log))
-    print("Run directory: {0}".format(work_dir))
-    print("Run success: {0}".format("yes" if success else "no"))
+    announce_result("Report path: {0}".format(report_path or "none"))
+    announce_result("Run log: {0}".format(run_log))
+    announce_result("Run directory: {0}".format(work_dir))
+    announce_result("Run success: {0}".format("yes" if success else "no"))
     if error:
-        print("Run error: {0}".format(error))
+        announce_result("Run error: {0}".format(error))
 
     if success:
         return 0
@@ -504,6 +527,7 @@ async def run_inside_env(args):
 
 
 def main():
+    announce_status("正在解析运行参数")
     args = parse_args()
     ensure_required(args)
     args.mode = normalize_mode(args.mode)
@@ -511,9 +535,13 @@ def main():
     if args._in_env:
         return asyncio.run(run_inside_env(args))
 
+    announce_status("正在准备主目录")
     parent_dir, parent_auto_created = ensure_work_dir(args.work_dir)
+    announce_status("正在读取或缓存访问令牌")
     token = resolve_access_token(args, parent_dir)
+    announce_status("正在创建本次 run 目录")
     work_dir = create_run_dir(parent_dir, args.agent_type, args.stock_code, args.mode)
+    announce_status("正在检查 Python 运行环境")
     runtime = find_python_runtime()
     env_python, runtime_env_dir = prepare_runtime(runtime, parent_dir)
     print_runtime_banner(parent_dir, work_dir, parent_auto_created, runtime, runtime_env_dir)
@@ -526,6 +554,7 @@ def main():
     child_env["PYTHONUNBUFFERED"] = "1"
 
     child_args = [env_python, "-u", str(Path(__file__).resolve())] + build_reexec_args(args, work_dir, parent_auto_created)
+    announce_status("正在启动子进程执行 agent client")
     completed = subprocess.run(child_args, env=child_env)
     return completed.returncode
 

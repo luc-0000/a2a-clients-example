@@ -138,7 +138,7 @@ class RunAgentClientTests(unittest.TestCase):
             self.assertEqual(Path(run_dir).parent, Path(tmpdir))
             self.assertRegex(
                 Path(run_dir).name,
-                r"^run-trading-600519-streaming-\d{8}-\d{6}$",
+                r"^fintools-agent-client-run-trading-600519-streaming-\d{8}-\d{6}$",
             )
 
     def test_create_run_dir_adds_sequence_when_timestamp_collides(self):
@@ -150,8 +150,8 @@ class RunAgentClientTests(unittest.TestCase):
             first_run = self.module.create_run_dir(tmpdir, "trading", "600519", "streaming")
             second_run = self.module.create_run_dir(tmpdir, "trading", "600519", "streaming")
 
-            self.assertEqual(Path(first_run).name, "run-trading-600519-streaming-20260312-120000")
-            self.assertEqual(Path(second_run).name, "run-trading-600519-streaming-20260312-120000-002")
+            self.assertEqual(Path(first_run).name, "fintools-agent-client-run-trading-600519-streaming-20260312-120000")
+            self.assertEqual(Path(second_run).name, "fintools-agent-client-run-trading-600519-streaming-20260312-120000-002")
 
     def test_shared_runtime_dir_for_venv(self):
         runtime = {"type": "venv", "detail": "current:{0}".format(sys.executable), "python": sys.executable}
@@ -177,6 +177,14 @@ class RunAgentClientTests(unittest.TestCase):
             Path("/tmp/example-run/run.log"),
         )
 
+    def test_announce_helpers_use_expected_prefixes(self):
+        with mock.patch("builtins.print") as mock_print:
+            self.module.announce_status("正在安装依赖")
+            self.module.announce_result("Report path: /tmp/example.zip")
+
+        self.assertEqual(mock_print.call_args_list[0].args[0], "[status] 正在安装依赖")
+        self.assertEqual(mock_print.call_args_list[1].args[0], "[result] Report path: /tmp/example.zip")
+
     def test_build_reexec_args_preserves_polling_mode(self):
         args = type(
             "Args",
@@ -200,7 +208,7 @@ class RunAgentClientTests(unittest.TestCase):
             with mock.patch.object(self.module, "parse_args") as mock_parse_args, \
                  mock.patch.object(self.module, "resolve_access_token", return_value="token"), \
                  mock.patch.object(self.module, "ensure_work_dir", return_value=(Path(tmpdir), True)), \
-                 mock.patch.object(self.module, "create_run_dir", return_value=Path(tmpdir) / "run-trading-600519-streaming-20260312-120000"), \
+                 mock.patch.object(self.module, "create_run_dir", return_value=Path(tmpdir) / "fintools-agent-client-run-trading-600519-streaming-20260312-120000"), \
                  mock.patch.object(self.module, "find_python_runtime", return_value={"type": "venv", "detail": "current:/usr/bin/python3", "python": "/usr/bin/python3"}), \
                  mock.patch.object(self.module, "print_runtime_banner"), \
                  mock.patch.object(self.module, "prepare_runtime", return_value=("/tmp/fake-python", "/tmp/fintools-agent-client-runs/shared-envs/venv-py311-deadbeef")), \

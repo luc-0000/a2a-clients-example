@@ -70,7 +70,7 @@ Current repository support:
 2. If `--work-dir` is provided, use it as the parent directory for runs.
 3. Otherwise use `/tmp/fintools-agent-client-runs/` when available.
 4. If `/tmp` is unavailable, fall back to the system temp root.
-5. Create a unique run subdirectory such as `run-trading-600519-streaming-20260312-120000`.
+5. Create a unique run subdirectory such as `fintools-agent-client-run-trading-600519-streaming-20260312-120000`.
    If the same name already exists within the same second, append a sequence suffix such as `-002`.
 6. Print both the parent directory and the current run directory immediately.
 7. Check whether the current Python satisfies 3.10+.
@@ -110,7 +110,7 @@ The working directory should contain at least:
 - `downloaded_reports/` when a report was downloaded
 
 Use `--work-dir` as the only user-facing directory parameter. Do not make the user choose separate runtime and output locations.
-Default auto-created parent directories should prefer `/tmp/fintools-agent-client-runs/`, with each run stored under its own `run-*` subdirectory.
+Default auto-created parent directories should prefer `/tmp/fintools-agent-client-runs/`, with each run stored under its own `fintools-agent-client-run-*` subdirectory.
 Keep shared environments under the parent directory as well, for example `shared-envs/venv-.../` or `shared-envs/conda-.../`.
 Keep optional probe output under `probe/` in the same parent directory instead of creating unrelated temp directories.
 Cache the access token in the parent directory so the user normally provides it only once per parent directory.
@@ -122,6 +122,9 @@ If the host agent cannot display subprocess stdout in real time, suggest reading
 
 Recommended behavior for OpenClaw or similar hosts:
 
+- Before each major step starts, forward the skill's `[status] ...` line to the user instead of waiting for the step to finish.
+- During execution, keep forwarding new `[status] ...` lines so the user knows what is happening now, for example environment checks, dependency installation, agent startup, polling, and report download.
+- At the end, always show the final `[result] Report path: ...` line to the user together with the run directory and log path.
 - Start the skill normally.
 - Read the printed run directory path.
 - Optionally poll `<run-dir>/run.log` for new content and show appended lines to the user.
