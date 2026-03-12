@@ -31,6 +31,7 @@ python3 fintools-agent-client/scripts/run_agent_client.py \
 
 Use a single user-facing directory concept: `--work-dir`. Treat it as the parent directory for all runs, create a dedicated run subdirectory for each execution, and keep shared environments under that parent directory.
 Store `FINTOOLS_ACCESS_TOKEN` in the parent directory after the first successful run so later runs can reuse it without asking again.
+If you run the optional streaming probe, keep its output under the same parent directory in `probe/`.
 
 ## Required Inputs
 
@@ -69,7 +70,8 @@ Current repository support:
 2. If `--work-dir` is provided, use it as the parent directory for runs.
 3. Otherwise use `/tmp/fintools-agent-client-runs/` when available.
 4. If `/tmp` is unavailable, fall back to the system temp root.
-5. Create a unique run subdirectory such as `run-YYYYMMDD-HHMMSS-abcdef`.
+5. Create a unique run subdirectory such as `run-trading-600519-streaming-20260312-120000`.
+   If the same name already exists within the same second, append a sequence suffix such as `-002`.
 6. Print both the parent directory and the current run directory immediately.
 7. Check whether the current Python satisfies 3.10+.
 8. Validate that the skill directory already contains bundled `agents_client/` and `requirements.txt`.
@@ -110,6 +112,7 @@ The working directory should contain at least:
 Use `--work-dir` as the only user-facing directory parameter. Do not make the user choose separate runtime and output locations.
 Default auto-created parent directories should prefer `/tmp/fintools-agent-client-runs/`, with each run stored under its own `run-*` subdirectory.
 Keep shared environments under the parent directory as well, for example `shared-envs/venv-.../` or `shared-envs/conda-.../`.
+Keep optional probe output under `probe/` in the same parent directory instead of creating unrelated temp directories.
 Cache the access token in the parent directory so the user normally provides it only once per parent directory.
 This skill must remain runnable even if the original `agent-client-template/` repository is removed, so all runtime code and `requirements.txt` stay bundled inside `fintools-agent-client/`.
 
@@ -129,6 +132,7 @@ This is only a compatibility suggestion for hosts with buffered subprocess outpu
 ## Resources
 
 - Script runner: [scripts/run_agent_client.py](./scripts/run_agent_client.py)
+- Streaming probe: [scripts/stream_probe.py](./scripts/stream_probe.py)
 - Runtime details and current limitations: [references/runtime-contract.md](./references/runtime-contract.md)
 
 ## Examples

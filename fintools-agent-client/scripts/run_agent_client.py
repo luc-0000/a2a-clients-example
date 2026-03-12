@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import random
 import shutil
 import subprocess
 import sys
@@ -22,6 +21,7 @@ RUN_PREFIX = "run-"
 SUMMARY_NAME = "summary.json"
 LOG_NAME = "run.log"
 SHARED_ENVS_DIRNAME = "shared-envs"
+PROBE_DIRNAME = "probe"
 LOCK_POLL_INTERVAL = 0.2
 LOCK_TIMEOUT_SECONDS = 300
 TOKEN_FILENAME = ".fintools_access_token"
@@ -182,12 +182,39 @@ def find_python_runtime():
     fail("No compatible Python 3.10+ interpreter or conda executable was found.")
 
 
-def create_run_dir(parent_dir):
+def safe_name_fragment(value):
+    allowed = []
+    for char in str(value or "").strip().lower():
+        if char.isalnum():
+            allowed.append(char)
+        elif char in {"-", "_"}:
+            allowed.append("-")
+    fragment = "".join(allowed).strip("-")
+    return fragment or "unknown"
+
+
+def create_run_dir(parent_dir, agent_type, stock_code, mode):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    suffix = "{0:06x}".format(random.randrange(16 ** 6))
-    run_dir = Path(parent_dir) / "{0}{1}-{2}".format(RUN_PREFIX, timestamp, suffix)
-    run_dir.mkdir(parents=False, exist_ok=False)
-    return run_dir
+    base_name = "{0}{1}-{2}-{3}-{4}".format(
+        RUN_PREFIX,
+        safe_name_fragment(agent_type),
+        safe_name_fragment(stock_code),
+        safe_name_fragment(mode),
+        timestamp,
+    )
+    parent_path = Path(parent_dir)
+    run_dir = parent_path / base_name
+    if not run_dir.exists():
+        run_dir.mkdir(parents=False, exist_ok=False)
+        return run_dir
+
+    for sequence in range(2, 1000):
+        candidate = parent_path / "{0}-{1:03d}".format(base_name, sequence)
+        if not candidate.exists():
+            candidate.mkdir(parents=False, exist_ok=False)
+            return candidate
+
+    fail("Could not allocate a unique run directory under {0}".format(parent_dir))
 
 
 def shared_envs_dir(parent_dir):
@@ -486,7 +513,7 @@ def main():
 
     parent_dir, parent_auto_created = ensure_work_dir(args.work_dir)
     token = resolve_access_token(args, parent_dir)
-    work_dir = create_run_dir(parent_dir)
+    work_dir = create_run_dir(parent_dir, args.agent_type, args.stock_code, args.mode)
     runtime = find_python_runtime()
     env_python, runtime_env_dir = prepare_runtime(runtime, parent_dir)
     print_runtime_banner(parent_dir, work_dir, parent_auto_created, runtime, runtime_env_dir)

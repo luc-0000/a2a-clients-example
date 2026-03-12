@@ -1,3 +1,4 @@
+from datetime import datetime
 import importlib.util
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ from unittest import mock
 MODULE_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "run_agent_client.py"
 )
+STREAM_PROBE_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "stream_probe.py"
+)
 
 
 def load_module():
@@ -21,10 +25,19 @@ def load_module():
     return module
 
 
+def load_stream_probe_module():
+    spec = importlib.util.spec_from_file_location("stream_probe", STREAM_PROBE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 class RunAgentClientTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.module = load_module()
+        cls.stream_probe = load_stream_probe_module()
 
     def test_normalize_mode_accepts_streaming(self):
         self.assertEqual(self.module.normalize_mode("streaming"), "streaming")
@@ -103,12 +116,42 @@ class RunAgentClientTests(unittest.TestCase):
             work_dir, auto_created = self.module.ensure_work_dir(None)
         self.assertTrue(auto_created)
         self.assertEqual(Path(work_dir).parent, Path("/tmp"))
+        self.assertEqual(Path(work_dir).name, "fintools-agent-client-runs")
+
+    def test_stream_probe_uses_same_default_parent_dir(self):
+        parent_dir = self.stream_probe.ensure_parent_dir(None)
+        self.assertEqual(parent_dir, Path("/tmp/fintools-agent-client-runs"))
+
+    def test_stream_probe_keeps_output_under_probe_directory(self):
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-parent-") as tmpdir:
+            probe_dir = self.stream_probe.ensure_probe_dir(tmpdir)
+            self.assertEqual(probe_dir, Path(tmpdir) / "probe")
+
+    def test_safe_name_fragment(self):
+        self.assertEqual(self.module.safe_name_fragment("Deep Research"), "deepresearch")
+        self.assertEqual(self.module.safe_name_fragment("600519"), "600519")
+        self.assertEqual(self.module.safe_name_fragment("streaming"), "streaming")
 
     def test_create_run_dir_under_parent(self):
         with tempfile.TemporaryDirectory(prefix="fintools-agent-client-parent-") as tmpdir:
-            run_dir = self.module.create_run_dir(tmpdir)
+            run_dir = self.module.create_run_dir(tmpdir, "trading", "600519", "streaming")
             self.assertEqual(Path(run_dir).parent, Path(tmpdir))
-            self.assertTrue(Path(run_dir).name.startswith("run-"))
+            self.assertRegex(
+                Path(run_dir).name,
+                r"^run-trading-600519-streaming-\d{8}-\d{6}$",
+            )
+
+    def test_create_run_dir_adds_sequence_when_timestamp_collides(self):
+        fixed_now = datetime(2026, 3, 12, 12, 0, 0)
+        with tempfile.TemporaryDirectory(prefix="fintools-agent-client-parent-") as tmpdir, \
+             mock.patch.object(self.module, "datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+            mock_datetime.strftime = datetime.strftime
+            first_run = self.module.create_run_dir(tmpdir, "trading", "600519", "streaming")
+            second_run = self.module.create_run_dir(tmpdir, "trading", "600519", "streaming")
+
+            self.assertEqual(Path(first_run).name, "run-trading-600519-streaming-20260312-120000")
+            self.assertEqual(Path(second_run).name, "run-trading-600519-streaming-20260312-120000-002")
 
     def test_shared_runtime_dir_for_venv(self):
         runtime = {"type": "venv", "detail": "current:{0}".format(sys.executable), "python": sys.executable}
@@ -157,7 +200,7 @@ class RunAgentClientTests(unittest.TestCase):
             with mock.patch.object(self.module, "parse_args") as mock_parse_args, \
                  mock.patch.object(self.module, "resolve_access_token", return_value="token"), \
                  mock.patch.object(self.module, "ensure_work_dir", return_value=(Path(tmpdir), True)), \
-                 mock.patch.object(self.module, "create_run_dir", return_value=Path(tmpdir) / "run-20260312-abcdef"), \
+                 mock.patch.object(self.module, "create_run_dir", return_value=Path(tmpdir) / "run-trading-600519-streaming-20260312-120000"), \
                  mock.patch.object(self.module, "find_python_runtime", return_value={"type": "venv", "detail": "current:/usr/bin/python3", "python": "/usr/bin/python3"}), \
                  mock.patch.object(self.module, "print_runtime_banner"), \
                  mock.patch.object(self.module, "prepare_runtime", return_value=("/tmp/fake-python", "/tmp/fintools-agent-client-runs/shared-envs/venv-py311-deadbeef")), \

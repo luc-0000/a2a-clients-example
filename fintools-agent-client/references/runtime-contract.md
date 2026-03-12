@@ -16,8 +16,10 @@ This skill wraps the repository's existing client modules so another agent does 
 - Otherwise use `/tmp/fintools-agent-client-runs/` as the default parent directory when available.
 - If `/tmp` is unavailable, fall back to the system temp root.
 - Keep shared environments under the parent directory, for example `shared-envs/`.
+- Keep optional streaming probe output under the parent directory in `probe/`.
 - Keep the cached access token in the parent directory as `.fintools_access_token`.
-- Create a unique `run-*` subdirectory for each execution.
+- Create a unique run subdirectory for each execution named like `run-<agent_type>-<stock_code>-<mode>-<timestamp>`.
+- If the same name already exists, append a numeric sequence such as `-002`.
 - Write the environment, `summary.json`, `run.log`, and `downloaded_reports/` into that run subdirectory.
 - Do not delete the parent directory automatically.
 - Delete only the current run subdirectory when the user explicitly requested cleanup.
