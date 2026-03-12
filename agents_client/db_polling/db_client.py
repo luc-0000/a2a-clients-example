@@ -159,8 +159,9 @@ class DatabaseAgentClient:
 class StockAgentClientDB(DatabaseAgentClient):
     """面向 `stock_code` 参数的通用 DB 客户端。"""
 
-    def __init__(self, agent_url: str, **kwargs):
+    def __init__(self, agent_url: str, default_reports_dir: str | None = None, **kwargs):
         super().__init__(agent_url, **kwargs)
+        self.default_reports_dir = default_reports_dir or "downloaded_reports"
         self.report_downloader = ReportDownloader(
             agent_url=normalize_agent_base_url(agent_url),
             a2a_token=kwargs.get("a2a_token"),
@@ -169,15 +170,20 @@ class StockAgentClientDB(DatabaseAgentClient):
             reports_zip_path="reports/zip",
         )
 
-    async def analyze_stock(self, stock_code: str, download_reports: bool = True) -> dict[str, Any]:
+    async def analyze_stock(
+        self,
+        stock_code: str,
+        download_reports: bool = True,
+        report_output_dir: str | None = None,
+    ) -> dict[str, Any]:
         result = await self.execute({"stock_code": stock_code})
         if download_reports and result.get("status") == "completed":
-            if downloaded_file := await self.download_reports_zip():
+            if downloaded_file := await self.download_reports_zip(report_output_dir):
                 result["downloaded_file"] = downloaded_file
         return result
 
-    async def download_reports_zip(self, output_dir: str = "downloaded_reports") -> str | None:
-        return await self.report_downloader.download_zip(output_dir)
+    async def download_reports_zip(self, output_dir: str | None = None) -> str | None:
+        return await self.report_downloader.download_zip(output_dir or self.default_reports_dir)
 
 
 async def run_stock_agent_client(
@@ -187,6 +193,7 @@ async def run_stock_agent_client(
     stock_code: str,
     a2a_token: str,
     task_id: str | None = None,
+    report_output_dir: str | None = None,
 ) -> dict[str, Any]:
     print(f"\n{'=' * 60}")
     print(f"{title} (Database Mode)")
@@ -205,7 +212,7 @@ async def run_stock_agent_client(
     if task_id:
         result = await recover_task(client, task_id)
     else:
-        result = await client.analyze_stock(stock_code, download_reports=False)
+        result = await client.analyze_stock(stock_code, download_reports=False, report_output_dir=report_output_dir)
 
     print("\n\n最终结果:")
     print(f"  状态: {result.get('status')}")
@@ -216,7 +223,7 @@ async def run_stock_agent_client(
         print(f"  错误: {result['error']}")
 
     if result.get("status") == "completed":
-        await print_report_download_result(client)
+        await print_report_download_result(client, report_output_dir)
 
     return result
 
@@ -246,10 +253,10 @@ async def recover_task(client: DatabaseAgentClient, task_id: str) -> dict[str, A
     return await client.wait_for_task(task_id)
 
 
-async def print_report_download_result(client: StockAgentClientDB) -> None:
+async def print_report_download_result(client: StockAgentClientDB, report_output_dir: str | None = None) -> None:
     print("\n[Reports] Downloading reports...")
     try:
-        download_result = await client.download_reports_zip()
+        download_result = await client.download_reports_zip(report_output_dir)
     except Exception as exc:
         error_msg = str(exc)
         if "410" in error_msg:

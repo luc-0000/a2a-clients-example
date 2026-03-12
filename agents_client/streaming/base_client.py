@@ -124,12 +124,6 @@ class StreamingStockAgentClient:
                 agent_args={"stock_code": stock_code},
             )
 
-    async def show_reports(self) -> list:
-        return await self.report_downloader.show_reports()
-
-    async def download_reports_zip(self) -> str | None:
-        return await self.report_downloader.download_zip()
-
 
 async def run_stock_agent_client(
     client_cls: type[StreamingStockAgentClient],
@@ -152,6 +146,6 @@ async def run_stock_agent_client(
     print(f"执行完成！共处理 {result['event_count']} 个事件")
     print(f"{'=' * 60}\n")
 
-    await client.show_reports()
-    await client.download_reports_zip()
+    await client.report_downloader.show_reports()
+    await client.report_downloader.download_zip()
     return result["success"]

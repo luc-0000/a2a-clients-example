@@ -64,7 +64,7 @@ class ReportDownloader:
         self.agent_url = agent_url.rstrip("/")
         self.a2a_token = a2a_token or ""
         self.timeout = timeout
-        
+
         # 构造报告 URL
         self.reports_url = f"{self.agent_url}/{reports_path}"
         self.reports_zip_url = f"{self.agent_url}/{reports_zip_path}"
@@ -113,7 +113,18 @@ class ReportDownloader:
 
         return reports
 
-    async def download_zip(self, output_dir: str = "downloaded_reports") -> str | None:
+    async def download_zip(self, output_dir: str | None = None) -> str | None:
+        """
+        打包下载所有报告为 ZIP 文件
+
+        Args:
+            output_dir: 输出目录（默认 relative path "downloaded_reports"）
+
+        Returns:
+            下载后的文件路径，失败返回 None
+        """
+        if output_dir is None:
+            output_dir = "downloaded_reports"
         """
         打包下载所有报告为 ZIP 文件
 
