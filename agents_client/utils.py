@@ -5,6 +5,8 @@ A2A Agent Client 公共工具
 - 报告下载（可被 streaming 和 db_polling 模式共用）
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import sys

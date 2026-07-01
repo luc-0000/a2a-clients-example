@@ -1,168 +1,170 @@
-# Agent Client Template
+# FinTools A2A Client Template
 
-这个项目提供两类客户端，用来调用远端 Agent 并取回结果：
+调用 FinTools 平台上的 task agent（trading / deep research / data 等），实时看 status 变化，跑完后下载报告 ZIP。
 
-- `Deep Research Agent`：拿研究报告，最终下载 ZIP 报告包
-- `Trading Agent`：拿交易结果，同时下载报告 ZIP
+## 1. 调用流程
 
-适合两种使用者：
+FinTools 的 task agent 跑法是「Job 模式」——你 POST 一次任务，backend 在云端起一个 Pod 跑 `main.py`，跑完写报告到 OSS。这个 template 把整套流程包装成一条命令：
 
-- `OpenClaw` 这类 agent：按命令逐步执行即可
-- 人类开发者：看完下面 3 分钟内可以跑通
+```
+POST /agents/{id}/a2a/                     →  拿到 run_id（任务立刻被 accept）
+GET  /agents/{id}/tasks/{run_id}           →  轮询 status：pending → running → completed
+GET  /agents/{id}/reports/zip              →  下载报告 ZIP（仅 status=completed 后）
+```
 
-## 1. 先决条件
+client 默认每 5 秒 poll 一次，每次 status 变化会增量打印一行（伪 streaming 体验）。
 
-- Python 3.10+
-- 可访问的 Agent 服务
-- 有效的 `FINTOOLS_ACCESS_TOKEN`
+## 2. 先决条件
 
-安装依赖：
+- Python 3.9+
+- FinTools 账号 + 一份有效的 `FINTOOLS_ACCESS_TOKEN`
+- 目标 task agent 的 URL（FinTools agent 详情页能看到，形如 `https://fin-meta.net/api/v1/agents/{id}/a2a/`）
+
+### 拿 token
+
+1. 登录 FinTools（本地 `http://localhost` 或线上 `https://fin-meta.net`）
+2. 右上角头像 → **User Profile**
+3. 复制 `FINTOOLS_ACCESS_TOKEN` 字段
+
+token 等同于你的账号凭证，**不要提交到 git**。本仓库 `.gitignore` 已排除 `.env`。
+
+## 3. 安装
 
 ```bash
+git clone https://github.com/luc-0000/a2a-clients-example.git
+cd a2a-clients-example
+
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-配置环境变量：
+配置 token（二选一）：
 
 ```bash
+# 方式 A：写入 .env（推荐，长期使用）
+echo 'FINTOOLS_ACCESS_TOKEN=your-token-here' > .env
+
+# 方式 B：当前 shell export（临时）
 export FINTOOLS_ACCESS_TOKEN=your-token-here
 ```
 
-`FINTOOLS_ACCESS_TOKEN` 的获取方式：
+## 4. 调用 trading agent
 
-- 先在 Fintools 平台注册账号
-- 登录后进入 `User Profile` 页面
-- 在页面里复制你的 `FINTOOLS_ACCESS_TOKEN`
-
-也可以写入项目根目录 `.env`：
-
-```dotenv
-FINTOOLS_ACCESS_TOKEN=your-token-here
+```bash
+python -m agents_client.streaming.trading_agent_client_stream \
+    000001 \
+    http://127.0.0.1:8000/api/v1/agents/1/a2a/
 ```
 
-## 2. OpenClaw 最短执行路径
+参数顺序：
+1. `stock_code` — 比如 `000001`（平安银行）、`600519`（贵州茅台）、`00700`（腾讯）
+2. `agent_url` — task agent 的 a2a URL
+3. `report_output_dir`（可选）— ZIP 保存目录，默认 `agents_client/streaming/downloaded_reports/`
 
-OpenClaw 建议严格按这个顺序执行：
+预期输出：
 
-1. 进入项目目录
-2. 激活虚拟环境并安装依赖
-3. 设置 `FINTOOLS_ACCESS_TOKEN`
-4. 运行目标 client
-5. 等待任务结束
-6. 读取终端输出里的结果摘要
-7. 到 `downloaded_reports/` 找 ZIP 报告
+```
+============================================================
+Trading Agent Client
+============================================================
+Agent URL:    http://127.0.0.1:8000/api/v1/agents/1/a2a
+股票代码:     000001
+A2A Token:    2fe71dbebe...
+轮询间隔:     5.0s
+心跳超时:     300.0s
+============================================================
+
+[submitted] run_id=6b4387d0-18b6-439e-951c-6ed771b49443
+            job=agent-1-jv3xteqj-1782889534
+[status]    (start) → pending
+[status]    pending → running
+[status]    running → completed
+
+[result]    status=completed
+            result=buy
+
+[reports]   downloading ZIP...
+[reports]   saved to agents_client/streaming/downloaded_reports/reports_xxx.zip
+```
 
 成功标志：
-
-- 终端出现 `执行完成` 或 `任务最终结果`
+- 终端出现 `[status]    ... → completed`
 - `downloaded_reports/` 下出现新的 `.zip` 文件
 
-## 3. 拿 report
+## 5. 调用 deep research agent
 
-运行 Deep Research streaming client：
-
-```bash
-python -m agents_client.streaming.dr_agent_client_stream 600519
-```
-
-说明：
-
-- `600519` 是股票代码，可替换
-- 该命令会：
-  - 发起分析任务
-  - 实时打印 Agent 状态
-  - 列出报告
-  - 自动下载 ZIP 报告到 `downloaded_reports/`
-
-产出位置：
+完全一样，换 client 名字 + agent_url：
 
 ```bash
-downloaded_reports/
+python -m agents_client.streaming.dr_agent_client_stream \
+    600519 \
+    http://127.0.0.1:8000/api/v1/agents/82/a2a/
 ```
 
-## 4. 拿 trading results
+deep research 的 `result` 是研究报告的文本摘要，ZIP 里是完整的 markdown / pdf。
 
-最直接的方式是运行 Trading streaming client：
+## 6. 调云端 vs 调本地
+
+`agent_url` 决定调哪里的 FinTools：
+
+| 环境 | `agent_url` 示例 |
+|---|---|
+| 本地 backend | `http://127.0.0.1:8000/api/v1/agents/{id}/a2a/` |
+| 线上 FinTools | `https://fin-meta.net/api/v1/agents/{id}/a2a/` |
+
+token 跟着环境走——本地用本地的 token，线上用线上的 token。
+
+## 7. 中途中断 / 恢复
+
+client 没有内置恢复——一旦 Ctrl+C，client 进程退出。但**云端任务不会停**，Pod 会继续跑。
+
+要恢复：把之前的 `run_id` 拿出来直接调 backend：
 
 ```bash
-python -m agents_client.streaming.trading_agent_client_stream 600519 http://127.0.0.1:8000/api/v1/agents/69/a2a/
+curl -H "Authorization: Bearer $FINTOOLS_ACCESS_TOKEN" \
+     http://127.0.0.1:8000/api/v1/agents/1/tasks/<run_id>
 ```
 
-说明：
+返回里有 `status`、`result`、`artifacts.report_url`（OSS signed URL，可直接下载报告）。
 
-- 第一个参数是股票代码
-- 第二个参数是 Trading Agent 的 `a2a` 地址
-- 命令执行后：
-  - 终端会持续输出交易任务状态
-  - 最后会列出并下载报告 ZIP
+## 8. 常见问题
 
-你通常会在终端里拿到两类信息：
+| 报错 | 原因 | 处理 |
+|---|---|---|
+| `未设置 FINTOOLS_ACCESS_TOKEN` | env 没加载到 | 检查 `.env` 是否在仓库根目录、是否 `source .venv/bin/activate` |
+| `401` / `Invalid token` | token 错或过期 | 重新去 User Profile 复制 |
+| `403 Run access denied` | 这个 agent 不对你开放 | 用 owner 自己的 token，或换 `run_policy=public` 的 agent |
+| `404 No task found` | run_id 不对，或者 task 不是你提交的 | 检查 run_id，每个 run_id 只能查提交者本人 |
+| `410 Server has been shut down` | Pod 已经 TTL 过期清理掉了 | 任务已经完成过、报告 ZIP 还在 OSS（看 `[result]` 输出里的 URL） |
+| 一直 `[status] pending → pending` 不变 | Pod 没起来，可能镜像没 build | 上 FinTools 后台看 build/deploy 状态 |
+| `[reports] no ZIP available` | Pod 已退出，HTTP 报告端点不可达 | 走 OSS signed URL（见 §7） |
 
-- `status-update` 文本：交易过程和最终结果摘要
-- `artifact-update` 文本：生成的文件提示
+## 9. 项目结构
 
-报告仍然会下载到：
-
-```bash
-downloaded_reports/
+```
+agents_client/
+├── utils.py                                  # ReportDownloader（POST 完成后下 ZIP）
+└── streaming/
+    ├── base_client.py                        # StreamingAgentClient（核心：submit + poll + emit）
+    ├── trading_agent_client_stream.py        # trading agent 入口
+    └── dr_agent_client_stream.py             # deep research agent 入口
 ```
 
-## 5. 需要可恢复轮询时
+`base_client.py` 里所有逻辑都跟 FinTools backend 的 `a2a_plane.py` 路由一一对应：
 
-如果你的 Trading Agent 走数据库轮询模式，使用：
+| client 方法 | backend endpoint | backend 代码位置 |
+|---|---|---|
+| `submit()` | `POST /agents/{id}/a2a/` | `a2a_plane.py:1052` |
+| `poll_once()` | `GET /agents/{id}/tasks/{run_id}` | `a2a_plane.py:171` |
+| `ReportDownloader.download_zip()` | `GET /agents/{id}/reports/zip` | `a2a_plane.py:207` |
 
-```bash
-python -m agents_client.db_polling.trading_agent_client_db
-```
+要扩展支持其他 task agent（data agent、hk_ai_agent 等），复制一份 `trading_agent_client_stream.py` 改 `DEFAULT_AGENT_URL` 和 client 名字就行，逻辑不动。
 
-这个模式适合任务很长、需要恢复执行的情况。它会：
+## 10. 关于"streaming"这个名字
 
-- 先创建任务
-- 定期轮询任务状态
-- 打印最终 `result`
-- 任务成功后自动下载报告 ZIP
+backend 对所有 task agent 都是 **job-mode**——POST `/a2a/` 立即返回 `{run_id, job_name, status:"job_started"}`，不返回 SSE 流（Pod 跑 main.py 后退出，没有 long-running HTTP server）。
 
-默认脚本内置了 agent URL 和股票代码；如果你要改目标地址或股票，直接修改 [agents_client/db_polling/trading_agent_client_db.py](/Users/lu/development/fintools_all/templates/agent-client-template/agents_client/db_polling/trading_agent_client_db.py) 里的 `agent_url` 和 `stock_code` 即可。
+这个 client 命名为 streaming 是因为**用户体验**是 streaming-like：每次 status 变化增量打印一行，看起来像在流式接收事件。底层实现是 polling。
 
-## 6. 输出位置和含义
-
-- 终端输出：任务状态、错误信息、结果摘要
-- `downloaded_reports/*.zip`：报告压缩包
-
-如果是 DB polling 模式，还会看到：
-
-- `Task ID`
-- 每次轮询的 `状态 / 进度 / 心跳 / 更新时间`
-- 最终 `result` 或 `error`
-
-## 7. 常见问题
-
-`未设置 FINTOOLS_ACCESS_TOKEN`
-
-- 说明没加载到环境变量或 `.env`
-
-`404 No reports available yet`
-
-- 任务还没完成，或者报告已过期
-
-`410 Server has been shut down`
-
-- Agent 服务已停止，报告无法再下载
-
-## 8. 对 OpenClaw 的执行建议
-
-如果你的目标只是“拿到 report 和 trading results”，优先使用这两条命令：
-
-```bash
-python -m agents_client.streaming.dr_agent_client_stream 600519
-python -m agents_client.streaming.trading_agent_client_stream 600519 http://127.0.0.1:8000/api/v1/agents/69/a2a/
-```
-
-判断任务成功时，不要只看退出码，还要同时检查：
-
-- 终端中是否出现成功完成信息
-- `downloaded_reports/` 是否生成新的 ZIP
-
-如果需要更强的稳定性和恢复能力，再切到 DB polling 模式。
+如果未来 FinTools 加了真正的 SSE 流式 agent，把 `base_client.py` 的 `stream_until_terminal()` 换成 a2a-sdk 的 `send_message_streaming` 即可，外部接口不变。

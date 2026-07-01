@@ -1,151 +1,226 @@
 """
-A2A Agent Client - streaming 模式
+Streaming-style A2A client for FinTools task agents.
+
+Backend behavior (a2a_plane.py:794): all task agents (trading / deep_research /
+data_agent / hk_ai_agent / test_agent) run in job-mode — POST /a2a/ returns
+{run_id, job_name, status:"job_started"} immediately, no SSE stream. The Pod
+runs main.py, exits, and writes reports to OSS.
+
+This client wraps that contract into a streaming-like UX:
+1. POST /a2a/ → run_id
+2. Poll GET /tasks/{run_id} every N seconds
+3. Print status transitions as they happen (the "stream")
+4. When status=completed, download reports ZIP
+
+No a2a-sdk dependency — pure httpx.
 """
 
+from __future__ import annotations
+
+import asyncio
+import json
 import os
+import sys
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import httpx
-from a2a.client import A2ACardResolver, A2AClient
-from a2a.types import MessageSendParams, SendStreamingMessageRequest
 from dotenv import load_dotenv
 
 from agents_client.utils import ReportDownloader, normalize_agent_base_url
 
 
-DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=60.0)
+DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=60.0)
 
 
 def load_project_env(module_file: str) -> None:
     load_dotenv(Path(module_file).resolve().parents[2] / ".env")
 
 
-class A2AAgentClient:
-    def __init__(self, agent_url: str, a2a_token: str | None = None, timeout: httpx.Timeout | None = None):
-        self.agent_url = agent_url
-        self.a2a_token = a2a_token or os.getenv("FINTOOLS_ACCESS_TOKEN", "your-secret-token-here")
-        self.timeout = timeout or DEFAULT_TIMEOUT
-        self.httpx_client: httpx.AsyncClient | None = None
-        self.client: A2AClient | None = None
+class StreamingAgentClient:
+    """Submit a task and stream status transitions until terminal state.
 
-    async def __aenter__(self):
-        self.httpx_client = httpx.AsyncClient(
-            timeout=self.timeout,
-            headers={
-                "Authorization": f"Bearer {self.a2a_token}",
-                "X-Server-Mode": "streaming",
-            },
-            trust_env=False,
-        )
-        agent_card = await A2ACardResolver(
-            httpx_client=self.httpx_client,
-            base_url=self.agent_url,
-        ).get_agent_card()
-        self.client = A2AClient(httpx_client=self.httpx_client, agent_card=agent_card, url=self.agent_url)
-        return self
+    Emits three kinds of inline events to make polling feel like a stream:
+      [submitted]  run_id assigned
+      [status]     status changed (pending → running → completed/failed)
+      [heartbeat]  periodic heartbeat confirmation
+    """
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.httpx_client:
-            await self.httpx_client.aclose()
-
-    async def send_message_streaming(
+    def __init__(
         self,
+        agent_url: str,
         *,
-        user_message: str,
-        agent_args: dict,
-        on_status_update=None,
-        on_artifact_update=None,
-        on_error=None,
-    ) -> dict:
-        req = SendStreamingMessageRequest(
-            id=str(uuid4()),
-            params=MessageSendParams(
-                message={
-                    "role": "user",
-                    "parts": [{
-                        "kind": "text",
-                        "text": user_message,
-                        "metadata": {"agent_args": agent_args},
-                    }],
-                    "messageId": uuid4().hex,
-                }
-            ),
-        )
-
-        event_count = 0
-        async for chunk in self.client.send_message_streaming(req):
-            event_count += 1
-            result = chunk.model_dump(mode="json", exclude_none=True).get("result")
-            if not result:
-                continue
-            await self._handle_stream_result(result, on_status_update, on_artifact_update, on_error)
-
-        return {"event_count": event_count, "success": True}
-
-    async def _handle_stream_result(self, result: dict, on_status_update, on_artifact_update, on_error) -> None:
-        if result.get("kind") == "status-update":
-            for part in result.get("status", {}).get("message", {}).get("parts", []):
-                text = part.get("text")
-                if not text:
-                    continue
-                if ("error" in text.lower() or "异常" in text) and on_error:
-                    await on_error(text)
-                if on_status_update:
-                    await on_status_update(text)
-                else:
-                    print(text)
-            return
-
-        if result.get("kind") == "artifact-update":
-            artifact = result.get("artifact", {})
-            if on_artifact_update:
-                await on_artifact_update(artifact)
-            else:
-                print(f"\n[生成文件] {artifact.get('name', 'unknown')}")
-
-
-class StreamingStockAgentClient:
-    def __init__(self, agent_url: str, user_message: str, a2a_token: str | None = None):
-        self.agent_url = agent_url
-        self.user_message = user_message
-        self.a2a_token = a2a_token
+        a2a_token: str | None = None,
+        poll_interval: float = 5.0,
+        heartbeat_timeout: float = 300.0,
+        max_wait: float = 1800.0,
+        timeout: httpx.Timeout | None = None,
+    ):
+        self.agent_url = agent_url.rstrip("/")
+        self.base_url = normalize_agent_base_url(self.agent_url)
+        self.a2a_token = a2a_token or os.getenv("FINTOOLS_ACCESS_TOKEN", "")
+        self.poll_interval = poll_interval
+        self.heartbeat_timeout = heartbeat_timeout
+        self.max_wait = max_wait
+        self.timeout = timeout or DEFAULT_TIMEOUT
+        self.headers = {"Authorization": f"Bearer {self.a2a_token}"} if self.a2a_token else {}
         self.report_downloader = ReportDownloader(
-            normalize_agent_base_url(agent_url),
-            a2a_token,
+            self.base_url,
+            self.a2a_token,
             reports_path="reports",
             reports_zip_path="reports/zip",
         )
 
-    async def analyze_stock(self, stock_code: str) -> dict:
-        async with A2AAgentClient(self.agent_url, self.a2a_token) as client:
-            return await client.send_message_streaming(
-                user_message=self.user_message.format(stock_code=stock_code),
-                agent_args={"stock_code": stock_code},
-            )
+    def _emit(self, kind: str, **fields: Any) -> None:
+        if kind == "submitted":
+            print(f"\n[submitted] run_id={fields.get('run_id')}")
+            print(f"            job={fields.get('job_name')}")
+        elif kind == "status":
+            print(f"[status]    {fields.get('prev')} → {fields.get('now')}")
+        elif kind == "heartbeat":
+            age = fields.get("age_seconds")
+            if age is not None:
+                print(f"[heartbeat] {age:.0f}s ago")
+        elif kind == "result":
+            print(f"\n[result]    status={fields.get('status')}")
+            if fields.get("result"):
+                preview = str(fields["result"])[:300]
+                print(f"            result={preview}")
+            if fields.get("error"):
+                print(f"            error={fields['error']}")
+        elif kind == "info":
+            print(f"[info]      {fields.get('msg')}")
+
+    async def submit(self, agent_args: dict[str, Any], user_text: str = "submit task") -> str:
+        """POST /a2a/ with A2A JSON-RPC body. Returns run_id."""
+        body = {
+            "jsonrpc": "2.0",
+            "method": "message/stream",
+            "id": uuid4().hex,
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{
+                        "type": "text",
+                        "text": user_text,
+                        "metadata": {"agent_args": agent_args},
+                    }],
+                }
+            },
+        }
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            response = await client.post(self.agent_url, json=body, headers=self.headers)
+            response.raise_for_status()
+            data = response.json()
+
+        run_id = data.get("run_id") or data.get("task_id")
+        if not run_id:
+            raise ValueError(f"backend response missing run_id: {data}")
+
+        self._emit("submitted", run_id=run_id, job_name=data.get("job_name", "unknown"))
+        return run_id
+
+    async def poll_once(self, run_id: str) -> dict[str, Any]:
+        url = f"{self.base_url}/tasks/{run_id}"
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=self.headers)
+            response.raise_for_status()
+            return response.json()
+
+    async def stream_until_terminal(self, run_id: str) -> dict[str, Any]:
+        """Poll /tasks/{run_id} until status is completed/failed. Emit transitions."""
+        prev_status: str | None = None
+        waited = 0.0
+        last_emit_at = 0.0
+
+        while waited < self.max_wait:
+            task = await self.poll_once(run_id)
+            status = task.get("status", "unknown")
+
+            if status != prev_status:
+                self._emit("status", prev=prev_status or "(start)", now=status)
+                prev_status = status
+                last_emit_at = waited
+            elif status != "completed" and status != "failed" and (waited - last_emit_at) >= 30.0:
+                # Tick: status hasn't changed for 30s, reassure user we're still alive
+                self._emit("info", msg=f"waited {waited:.0f}s, still {status}")
+                last_emit_at = waited
+
+            if status in {"completed", "failed"}:
+                self._emit(
+                    "result",
+                    status=status,
+                    result=task.get("result"),
+                    error=task.get("error"),
+                )
+                return task
+
+            # heartbeat: emit only if backend reports heartbeat_at
+            hb_age = self._heartbeat_age_seconds(task.get("heartbeat_at"))
+            if hb_age is not None and (waited - last_emit_at) >= 30.0:
+                self._emit("heartbeat", age_seconds=hb_age)
+                last_emit_at = waited
+                if hb_age > self.heartbeat_timeout:
+                    self._emit(
+                        "info",
+                        msg=f"heartbeat stale ({hb_age:.0f}s > {self.heartbeat_timeout}s) — Pod may have died",
+                    )
+
+            await asyncio.sleep(self.poll_interval)
+            waited += self.poll_interval
+
+        self._emit("info", msg=f"max_wait exceeded ({self.max_wait}s), final poll below")
+        return await self.poll_once(run_id)
+
+    @staticmethod
+    def _heartbeat_age_seconds(iso_time: str | None) -> float | None:
+        from datetime import datetime, timezone
+        if not iso_time:
+            return None
+        try:
+            parsed = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+    async def run(self, agent_args: dict[str, Any], user_text: str = "submit task") -> dict[str, Any]:
+        run_id = await self.submit(agent_args, user_text=user_text)
+        return await self.stream_until_terminal(run_id)
 
 
-async def run_stock_agent_client(
-    client_cls: type[StreamingStockAgentClient],
+async def run_stock_agent_stream(
+    client: StreamingAgentClient,
     title: str,
     stock_code: str,
-    agent_url: str,
-    a2a_token: str,
-) -> bool:
+    *,
+    download_reports: bool = True,
+    report_output_dir: str | None = None,
+) -> dict[str, Any]:
+    """Convenience entrypoint for stock-code-driven agents (trading / deep_research)."""
     print(f"\n{'=' * 60}")
-    print(f"运行 {title}, May take 30-60s to start server...")
+    print(f"{title}")
     print(f"{'=' * 60}")
-    print(f"股票代码: {stock_code}")
-    print(f"Agent地址: {agent_url}")
-    print(f"{'=' * 60}\n")
+    print(f"Agent URL:    {client.agent_url}")
+    print(f"股票代码:     {stock_code}")
+    print(f"A2A Token:    {client.a2a_token[:10]}...")
+    print(f"轮询间隔:     {client.poll_interval}s")
+    print(f"心跳超时:     {client.heartbeat_timeout}s")
+    print(f"{'=' * 60}")
 
-    client = client_cls(agent_url=agent_url, a2a_token=a2a_token)
-    result = await client.analyze_stock(stock_code)
+    result = await client.run({"stock_code": stock_code})
 
-    print(f"\n{'=' * 60}")
-    print(f"执行完成！共处理 {result['event_count']} 个事件")
-    print(f"{'=' * 60}\n")
+    if download_reports and result.get("status") == "completed":
+        print("\n[reports]   downloading ZIP...")
+        try:
+            downloaded = await client.report_downloader.download_zip(output_dir=report_output_dir)
+            if downloaded:
+                print(f"[reports]   saved to {downloaded}")
+            else:
+                print("[reports]   no ZIP available (Pod may have exited, fetch from OSS signed URL instead)")
+        except Exception as e:
+            print(f"[reports]   download failed: {e}")
 
-    await client.report_downloader.show_reports()
-    await client.report_downloader.download_zip()
-    return result["success"]
+    return result
