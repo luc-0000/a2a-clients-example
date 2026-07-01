@@ -204,10 +204,10 @@ async def run_stock_agent_stream(
     print(f"{title}")
     print(f"{'=' * 60}")
     print(f"Agent URL:    {client.agent_url}")
-    print(f"股票代码:     {stock_code}")
+    print(f"Stock code:   {stock_code}")
     print(f"A2A Token:    {client.a2a_token[:10]}...")
-    print(f"轮询间隔:     {client.poll_interval}s")
-    print(f"心跳超时:     {client.heartbeat_timeout}s")
+    print(f"Poll interval: {client.poll_interval}s")
+    print(f"Heartbeat timeout: {client.heartbeat_timeout}s")
     print(f"{'=' * 60}")
 
     result = await client.run({"stock_code": stock_code})

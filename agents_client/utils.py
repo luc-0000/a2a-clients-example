@@ -1,8 +1,8 @@
 """
-A2A Agent Client 公共工具
+A2A Agent Client shared utilities.
 
-提供通用的客户端功能：
-- 报告下载（可被 streaming 和 db_polling 模式共用）
+Provides common client-side functionality:
+- Report downloading (shared across client variants)
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_agent_base_url(agent_url: str) -> str:
-    """标准化 agent 基础地址：去掉末尾斜杠和 /a2a。"""
+    """Normalize the agent base URL: strip trailing slash and trailing /a2a."""
     normalized = agent_url.rstrip("/")
     if normalized.endswith("/a2a"):
         normalized = normalized[:-4]
@@ -27,20 +27,20 @@ def normalize_agent_base_url(agent_url: str) -> str:
 
 
 def require_access_token(env_var: str = "FINTOOLS_ACCESS_TOKEN") -> str:
-    """读取并校验访问 token，不存在则打印提示并退出。"""
+    """Read and validate the access token. If missing, print guidance and exit."""
     token = os.getenv(env_var)
     if token:
         return token
-    print(f"❌ 错误: 未设置 {env_var} 环境变量")
-    print("\n请在 .env 文件中设置:")
+    print(f"ERROR: {env_var} environment variable is not set")
+    print("\nSet it in your .env file:")
     print(f"  {env_var}=your-token-here")
-    print("\n或通过命令行设置:")
+    print("\nOr export it in your shell:")
     print(f"  export {env_var}=your-token-here")
     sys.exit(1)
 
 
 class ReportDownloader:
-    """报告下载器（通用，可被 streaming 和 db_polling 模式共用）"""
+    """Report downloader (shared across client variants)."""
 
     def __init__(
         self,
@@ -51,14 +51,14 @@ class ReportDownloader:
         reports_zip_path: str = "api/reports/zip",
     ):
         """
-        初始化报告下载器
+        Initialize the report downloader.
 
         Args:
-            agent_url: Agent Server 地址（如 http://localhost:9999）
-            a2a_token: 认证 token
-            timeout: HTTP 请求超时时间
-            reports_path: 报告列表路径（默认 api/reports）
-            reports_zip_path: ZIP 下载路径（默认 api/reports/zip）
+            agent_url: Agent Server URL (e.g. http://localhost:9999)
+            a2a_token: Auth token
+            timeout: HTTP request timeout
+            reports_path: Report list path (default api/reports)
+            reports_zip_path: ZIP download path (default api/reports/zip)
         """
         if not agent_url:
             raise ValueError("agent_url is required")
@@ -67,7 +67,7 @@ class ReportDownloader:
         self.a2a_token = a2a_token or ""
         self.timeout = timeout
 
-        # 构造报告 URL
+        # Build report URLs
         self.reports_url = f"{self.agent_url}/{reports_path}"
         self.reports_zip_url = f"{self.agent_url}/{reports_zip_path}"
 
@@ -77,30 +77,30 @@ class ReportDownloader:
         return {"Authorization": f"Bearer {self.a2a_token}"}
 
     async def list_reports(self) -> list:
-        """获取报告列表"""
+        """Fetch the report list."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(self.reports_url, headers=self._auth_headers())
 
             if response.status_code != 200:
-                logger.error(f"获取报告列表失败: {response.status_code}")
+                logger.error(f"Failed to fetch report list: {response.status_code}")
                 return []
 
             data = response.json()
             return data.get("reports", [])
 
     async def show_reports(self) -> list:
-        """显示报告列表"""
+        """Display the report list."""
         reports = await self.list_reports()
 
         print(f"\n{'='*60}")
-        print(f"报告列表")
+        print("Reports")
         print(f"{'='*60}")
 
         if not reports:
-            print("  暂无可用报告")
+            print("  No reports available")
             return []
 
-        print(f"共有 {len(reports)} 个报告:\n")
+        print(f"{len(reports)} report(s) available:\n")
 
         for i, report in enumerate(reports, 1):
             filename = report.get("filename", "unknown")
@@ -108,8 +108,8 @@ class ReportDownloader:
             modified = report.get("modified", "N/A")
 
             print(f"{i}. {filename}")
-            print(f"   大小: {size_kb:.1f} KB")
-            print(f"   修改: {modified}\n")
+            print(f"   size: {size_kb:.1f} KB")
+            print(f"   modified: {modified}\n")
 
         print(f"{'='*60}\n")
 
@@ -117,45 +117,36 @@ class ReportDownloader:
 
     async def download_zip(self, output_dir: str | None = None) -> str | None:
         """
-        打包下载所有报告为 ZIP 文件
+        Download all reports as a single ZIP file.
 
         Args:
-            output_dir: 输出目录（默认 relative path "downloaded_reports"）
+            output_dir: Output directory (defaults to relative path "downloaded_reports")
 
         Returns:
-            下载后的文件路径，失败返回 None
+            Path to the downloaded file, or None on failure.
         """
         if output_dir is None:
             output_dir = "downloaded_reports"
-        """
-        打包下载所有报告为 ZIP 文件
-
-        Args:
-            output_dir: 输出目录
-
-        Returns:
-            下载后的文件路径，失败返回 None
-        """
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            print(f"正在下载 ZIP 包...")
+            print(f"Downloading ZIP...")
             print(f"  URL: {self.reports_zip_url}")
 
             try:
                 response = await client.get(self.reports_zip_url, headers=self._auth_headers())
-                
-                # 处理特定的错误状态码
+
+                # Handle specific error status codes
                 if response.status_code == 410:
                     print(f"✗ Server has been shut down. Reports are no longer available.")
                     return None
                 elif response.status_code == 404:
                     print(f"✗ No reports available yet. Task may still be running or reports have expired.")
                     return None
-                
+
                 response.raise_for_status()
 
-                # 从响应头获取文件名
+                # Derive filename from response headers
                 content_disposition = response.headers.get("content-disposition", "")
                 if "filename=" in content_disposition:
                     filename = content_disposition.split("filename=")[1].strip('"')
@@ -165,20 +156,20 @@ class ReportDownloader:
                 output_path = Path(output_dir) / filename
                 output_path.write_bytes(response.content)
 
-                print(f"✓ 成功下载: {output_path}")
-                print(f"  大小: {len(response.content) / 1024:.1f} KB")
+                print(f"✓ Downloaded: {output_path}")
+                print(f"  size: {len(response.content) / 1024:.1f} KB")
                 return str(output_path)
-                
+
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 410:
                     print(f"✗ Server has been shut down. Reports are no longer available.")
                 elif e.response.status_code == 404:
                     print(f"✗ No reports available yet. Task may still be running or reports have expired.")
                 else:
-                    logger.error(f"下载失败: {e}")
-                    print(f"✗ 下载失败: {e}")
+                    logger.error(f"Download failed: {e}")
+                    print(f"✗ Download failed: {e}")
                 return None
             except Exception as e:
-                logger.error(f"下载失败: {e}")
-                print(f"✗ 下载失败: {e}")
+                logger.error(f"Download failed: {e}")
+                print(f"✗ Download failed: {e}")
                 return None
